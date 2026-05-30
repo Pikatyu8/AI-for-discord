@@ -1,1 +1,4 @@
+.gitignore
+.git
 .env
+discord-gemini.zip

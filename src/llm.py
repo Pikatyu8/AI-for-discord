@@ -1,0 +1,56 @@
+import asyncio
+from openai import AsyncOpenAI
+from src.config import PROXY_KEY, PROXY_BASE_URL, MODEL_NAME
+
+client = AsyncOpenAI(api_key=PROXY_KEY, base_url=PROXY_BASE_URL)
+
+TOOLS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "web_search",
+            "description": "Поиск актуальной информации в интернете. Используй этот инструмент, если в запросе пользователя есть вопросы о текущих новостях, погоде, фактах, датах событий или информации после января 2025 года.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "Поисковый запрос (например: 'погода в Москве сегодня', 'кто выиграл ЧМ по футболу 2026', 'последние новости ИИ')"
+                    }
+                },
+                "required": ["query"]
+            }
+        }
+    }
+]
+
+
+async def generate_content_with_retry(history: list, system_instruction: str, max_retries: int = 3, initial_delay: float = 2.0, tools=None):
+    """
+    Обертка для вызова API реселлера с автоповтором при временных ошибках.
+    """
+    delay = initial_delay
+    messages = [{"role": "system", "content": system_instruction}] + history
+    
+    for attempt in range(max_retries):
+        try:
+            kwargs = {
+                "model": MODEL_NAME,
+                "messages": messages,
+                "temperature": 0.7
+            }
+            if tools:
+                kwargs["tools"] = tools
+                
+            response = await client.chat.completions.create(**kwargs)
+            return response
+        except Exception as e:
+            err_msg = str(e)
+            is_transient = any(code in err_msg for code in ["429", "503", "RESOURCE_EXHAUSTED", "UNAVAILABLE"])
+            
+            if is_transient and attempt < max_retries - 1:
+                print(f"[API] Временная ошибка ({err_msg}). Повторная попытка {attempt + 2}/{max_retries} через {delay} сек...", flush=True)
+                await asyncio.sleep(delay)
+                delay *= 2
+            else:
+                raise e

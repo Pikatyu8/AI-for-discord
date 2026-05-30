@@ -1,0 +1,163 @@
+import io
+import base64
+
+def compress_image(img_bytes: bytes, max_size: int = 1000, quality: int = 70) -> bytes:
+    """
+    Сжимает изображение и уменьшает его разрешение, чтобы сэкономить ОЗУ хостинга и токены.
+    """
+    try:
+        from PIL import Image
+        
+        image = Image.open(io.BytesIO(img_bytes))
+        
+        # Конвертируем RGBA/P в RGB для сохранения в формате JPEG
+        if image.mode in ("RGBA", "P"):
+            image = image.convert("RGB")
+        
+        # Уменьшаем разрешение, сохраняя пропорции
+        image.thumbnail((max_size, max_size))
+        
+        output = io.BytesIO()
+        image.save(output, format="JPEG", quality=quality, optimize=True)
+        return output.getvalue()
+    except Exception as e:
+        print(f"[COMPRESS] Ошибка сжатия (используем оригинал): {e}", flush=True)
+        return img_bytes
+
+
+def log_last_message(history: list, stage: str):
+    """
+    Выводит в консоль информацию о последнем сообщении в памяти для отладки.
+    """
+    if not history:
+        print(f"[{stage}] Память пуста.", flush=True)
+        return
+        
+    last_msg = history[-1]
+    role = "Пользователь" if last_msg.get("role") == "user" else "Бот"
+    content = last_msg.get("content") or ""
+    
+    if isinstance(content, str):
+        preview = content if len(content) <= 80 else content[:80] + "..."
+    elif isinstance(content, list):
+        parts_preview = []
+        for part in content:
+            if part.get("type") == "text":
+                text = part.get("text", "")
+                parts_preview.append(text if len(text) <= 40 else text[:40] + "...")
+            elif part.get("type") == "image_url":
+                parts_preview.append("[Изображение]")
+        preview = " | ".join(parts_preview)
+    else:
+        preview = "[Формат не распознан]"
+        
+    print(f"[{stage}] Последнее сообщение в памяти ({role}): \"{preview}\"", flush=True)
+
+
+def is_image_attachment(attachment) -> bool:
+    """Проверяет, является ли вложение изображением."""
+    filename = attachment.filename.lower()
+    image_extensions = ('.png', '.jpg', '.jpeg', '.webp', '.gif', '.bmp', '.tiff', '.heic')
+    if filename.endswith(image_extensions):
+        return True
+    if attachment.content_type and attachment.content_type.startswith("image/"):
+        return True
+    return False
+
+
+def get_normalized_mime_type(attachment) -> str:
+    """Возвращает корректный MIME-тип."""
+    if attachment.content_type:
+        mime = attachment.content_type.lower()
+        if mime == 'image/jpg':
+            return 'image/jpeg'
+        return mime
+    
+    filename = attachment.filename.lower()
+    if filename.endswith('.png'):
+        return 'image/png'
+    if filename.endswith(('.jpg', '.jpeg')):
+        return 'image/jpeg'
+    if filename.endswith('.webp'):
+        return 'image/webp'
+    if filename.endswith('.gif'):
+        return 'image/gif'
+    return 'image/jpeg'
+
+
+def bytes_to_base64_url(img_bytes: bytes, mime_type: str) -> str:
+    """Конвертирует байты изображения в data-URL формат base64 с предварительным сжатием."""
+    compressed_bytes = compress_image(img_bytes)
+    base64_data = base64.b64encode(compressed_bytes).decode("utf-8")
+    return f"data:image/jpeg;base64,{base64_data}"
+
+
+def estimate_tokens(history: list) -> int:
+    """
+    Быстро и надежно оценивает объем контекста локально в памяти.
+    """
+    total_tokens = 350  # Базовый запас под системный промпт
+    for msg in history:
+        content = msg.get("content") or ""
+        if isinstance(content, str):
+            total_tokens += int(len(content) * 0.85) + 1
+        elif isinstance(content, list):
+            for part in content:
+                part_type = part.get("type")
+                if part_type == "text":
+                    text = part.get("text", "")
+                    total_tokens += int(len(text) * 0.85) + 1
+                elif part_type == "image_url":
+                    total_tokens += 300
+                    
+        tool_calls = msg.get("tool_calls")
+        if tool_calls:
+            for tc in tool_calls:
+                func = tc.get("function", {})
+                name = func.get("name", "")
+                args = func.get("arguments", "")
+                total_tokens += int((len(name) + len(args)) * 0.85) + 20
+    return total_tokens
+
+
+def prune_history_local(history: list, max_tokens: int = 128000) -> list:
+    """
+    Удаляет старые сообщения локально, используя быструю оценку токенов.
+    """
+    pruned = False
+    initial_tokens = estimate_tokens(history)
+    
+    while history:
+        total_tokens = estimate_tokens(history)
+        if total_tokens <= max_tokens:
+            break
+            
+        pruned = True
+        print(f"[PRUNE] Контекст ({total_tokens} токенов) превышает лимит ({max_tokens}). Очистка...", flush=True)
+        
+        first_msg = history[0]
+        content = first_msg.get("content") or ""
+        
+        if isinstance(content, list) and len(content) > 1:
+            content.pop(0)
+            print("[PRUNE] Удалено одно сообщение из объединенного блока пользователя.", flush=True)
+        else:
+            if len(history) >= 2:
+                history.pop(0)
+                history.pop(0)
+            else:
+                history.pop(0)
+            print("[PRUNE] Удален полный шаг диалога.", flush=True)
+            
+    # Гарантируем, что история не начнется с технического ответа ассистента или инструмента
+    while history and history[0].get("role") in ["assistant", "tool"]:
+        history.pop(0)
+        
+    final_tokens = estimate_tokens(history)
+    if pruned:
+        print(f"[PRUNE] Очистка завершена. Было: {initial_tokens} токенов, стало: {final_tokens} токенов.", flush=True)
+    else:
+        print(f"[PRUNE_CHECK] Контекст в норме ({final_tokens}/{max_tokens} токенов). Очистка не требуется.", flush=True)
+        
+    log_last_message(history, "PRUNE_END")
+    return history

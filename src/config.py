@@ -1,0 +1,22 @@
+import os
+import sys
+from dotenv import load_dotenv
+
+# Загружаем переменные из локального файла .env в систему
+load_dotenv()
+
+PROXY_KEY = os.getenv("PROXY_API_KEY")
+PROXY_BASE_URL = os.getenv("PROXY_BASE_URL", "https://api.vsegpt.ru/v1")
+MODEL_NAME = os.getenv("PROXY_MODEL_NAME", "google/gemma-4-26b-a4b-it")
+DISCORD_TOKEN = os.getenv("DISCORD_BOT_TOKEN")
+
+# Переменные для Google Custom Search
+GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
+GOOGLE_CSE_ID = os.getenv("GOOGLE_CSE_ID")
+
+# Новая переменная для ИИ-поиска Tavily
+TAVILY_API_KEY = os.getenv("TAVILY_API_KEY")
+
+if not PROXY_KEY:
+    print("КРИТИЧЕСКАЯ ОШИБКА: Переменная PROXY_API_KEY не задана!", flush=True)
+    sys.exit(1)
