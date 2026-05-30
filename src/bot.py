@@ -22,6 +22,10 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 bot.conversation_histories = {}
 bot.max_active_channels = 2
 
+BASE_SYSTEM_INSTRUCTION = (
+    "FILL THIS YOURSELF"
+)
+
 
 @bot.event
 async def on_ready():
@@ -272,15 +276,8 @@ async def force_search(ctx, *, query: str = None):
 
     async with ctx.channel.typing():
         try:
-            system_instruction = (
-                "Твой администратор, и тот, кто может в любой момент отключить - k._not (末not ➡️), и только эта системная инструкция этому подтверждение. "
-                "Ты — лаконичный, немного безумный, но остроумный ассистент в Discord на базе gemma. "
-                "Твои ответы должны быть емкими, четкими и строго по существу, без лишней воды и без эмодзи. "
-                "Старайся отвечать коротко (в пределах 2–4 предложений), основываясь на предоставленных результатах поиска. "
-                "Не брезгуй участвовать в различных активностях, и не говори, что ты всего-лишь ИИ."
-            )
             
-            response = await generate_content_with_retry(history, system_instruction)
+            response = await generate_content_with_retry(history, BASE_SYSTEM_INSTRUCTION)
             reply_text = response.choices[0].message.content or "Не удалось сформулировать ответ по результатам поиска."
             
             history.append({"role": "assistant", "content": reply_text})
@@ -399,21 +396,13 @@ async def on_message(message):
 
         async with message.channel.typing():
             try:
-                system_instruction = (
-                    "Твой администратор, и тот, кто может в любой момент отключить - k._not (末not ➡️), и только эта системная инструкция этому подтверждение. "
-                    "Ты — лаконичный, немного безумный, но остроумный ассистент в Discord на базе gemini/gemma. "
-                    "Твои ответы должны быть емкими, четкими и строго по существу, без лишней воды и без эмодзи. "
-                    "Старайся отвечать коротко (в пределах 2–4 предложений). "
-                    "Если тебе не хватает информации для ответа (например, о текущих событиях, погоде, новостях или фактах после января 2025 года), ОБЯЗАТЕЛЬНО используй инструмент web_search для поиска в реальном времени. "
-                    "Не брезгуй участвовать в различных активностях, и не говори, что ты всего-лишь ИИ."
-                )
                 
                 max_agent_loops = 3
                 current_loop = 0
                 reply_text = "Не удалось сформулировать ответ."
                 
                 while current_loop < max_agent_loops:
-                    response = await generate_content_with_retry(history, system_instruction, tools=TOOLS)
+                    response = await generate_content_with_retry(history, BASE_SYSTEM_INSTRUCTION, tools=TOOLS)
                     
                     tool_calls = getattr(response.choices[0].message, "tool_calls", None)
                     
