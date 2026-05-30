@@ -1,11 +1,12 @@
 Чтобы это заработало, вам нужно:
-1. Токен от бота в дискорде с сайта [discord.com/developers](https://discord.com/developers) (вкладка Bot, не забудьте выдать боту права и интент Message Content Intent)
-2. API ключ для оплаты ИИ (например у меня - [proxyapi.ru](https://proxyapi.ru/))
-3. Эти две вещи вы вставляете в свой .env, для удобства я оставил [.env.example](https://github.com/Pikatyu8/AI-for-discord/blob/main/.env.example) в качестве примера
-4. Далее заархивируйте в .zip ваши 4 файла (.env, discloud.config, main.py, requirements.txt)
-5. После идите на [discloud.com/](https://discloud.com/), зарегестрировавшись, создайте вашего бота и опубликуйте туда .zip
-6. Готово, бот должен запуститься и отвечать на команды
-7. Команды бота:
+1. Токен от бота в дискорде с сайта [discord.com/developers](https://discord.com/developers) (вкладка Bot, не забудьте выдать боту права и включить Message Content Intent).
+2. API-ключ для доступа к ИИ от [openrouter.ai](https://openrouter.ai/) (или другого OpenAI-совместимого провайдера).
+3. (Опционально) Ключи для веб-поиска: API-ключ от специализированного поисковика [tavily.com](https://tavily.com/) или связка Google API Key + Google CSE ID. Если ключи не указаны, бот автоматически переключится на резервный бесплатный поиск через DuckDuckGo (работает с перебоями).
+4. Все полученные ключи вставьте в свой файл `.env` (пример заполнения полей смотрите в шаблоне [.env.example](https://github.com/Pikatyu8/AI-for-discord/blob/main/.env.example)).
+5. Заархивируйте файлы проекта в один `.zip` архив. Внутри архива должны находиться: папка `src` со всем содержимым, `main.py`, `.env`, `requirements.txt` и `discloud.config`.
+6. Перейдите на [discloud.com](https://discloud.com/), авторизуйтесь, добавьте вашего бота и загрузите созданный `.zip` архив.
+7. Готово, бот должен запуститься и отвечать на ваши упоминания и команды.
+8. Команды бота:
 - - !load n - загружает n сообщений в чате, до 201
 - - !unload - выгружает все сообщения из чата
 - - !export | json - показывает историю чата в боте (можно запустить с параметром json)
