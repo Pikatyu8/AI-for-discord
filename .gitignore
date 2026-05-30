@@ -2,3 +2,4 @@
 .git
 .env
 discord-gemini.zip
+src/__pycache__/
