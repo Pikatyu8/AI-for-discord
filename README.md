@@ -1,3 +1,23 @@
+# EN
+To make this work, you need:
+1. A Discord bot token from [discord.com/developers](https://discord.com/developers) (Bot tab; make sure to grant the bot permissions and enable the Message Content Intent).
+2. An AI access API key from [openrouter.ai](https://openrouter.ai/) (or another OpenAI-compatible provider).
+3. (Optional) Web search keys: an API key from the specialized search engine [tavily.com](https://tavily.com/) or a Google API Key + Google CSE ID combination. If these keys are not provided, the bot will automatically fall back to a free search via DuckDuckGo (which works intermittently).
+4. Insert all the obtained keys into your `.env` file (refer to the [.env.example](https://github.com/Pikatyu8/AI-for-discord/blob/main/.env.example) template for examples of how to fill in the fields).
+5. Archive the project files into a single `.zip` file. Inside the archive, there must be: the `src` folder with all its contents, `main.py`, `.env`, `requirements.txt`, and `discloud.config`.
+6. Go to [discloud.com](https://discloud.com/), log in, add your bot, and upload the created `.zip` archive.
+7. Done! The bot should start up and respond to your mentions and commands.
+8. Bot commands:
+- !load n - loads n messages in the chat, up to 201
+- !unload - unloads all messages from the chat
+- !export | json - shows the bot's chat history (can be run with the json parameter)
+- !show - shows where the bot is active
+- !stop - pauses message recording in the channel
+- !maxchannels n - sets the maximum number of active channels for the bot (default is 2)
+
+---
+
+# RU
 Чтобы это заработало, вам нужно:
 1. Токен от бота в дискорде с сайта [discord.com/developers](https://discord.com/developers) (вкладка Bot, не забудьте выдать боту права и включить Message Content Intent).
 2. API-ключ для доступа к ИИ от [openrouter.ai](https://openrouter.ai/) (или другого OpenAI-совместимого провайдера).
