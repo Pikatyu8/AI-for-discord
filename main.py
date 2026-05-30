@@ -26,7 +26,6 @@ if not PROXY_KEY:
 # Инициализация OpenAI-совместимого клиента
 client = AsyncOpenAI(api_key=PROXY_KEY, base_url=PROXY_BASE_URL)
 conversation_histories = {}
-paused_channels = set()  # Будет хранить ID каналов с временно отключенным логгированием
 max_active_channels = 2  # Ограничение по умолчанию на количество одновременно активных каналов
 
 # Настройка интентов Discord
@@ -62,6 +61,7 @@ def compress_image(img_bytes: bytes, max_size: int = 1000, quality: int = 70) ->
         # Если Pillow не установлена или произошла ошибка, возвращаем исходные байты
         print(f"[COMPRESS] Ошибка сжатия (используем оригинал): {e}", flush=True)
         return img_bytes
+
 
 def log_last_message(history: list, stage: str):
     """
@@ -102,6 +102,7 @@ def is_image_attachment(attachment) -> bool:
         return True
     return False
 
+
 def get_normalized_mime_type(attachment) -> str:
     """Возвращает корректный MIME-тип."""
     if attachment.content_type:
@@ -121,9 +122,9 @@ def get_normalized_mime_type(attachment) -> str:
         return 'image/gif'
     return 'image/jpeg'
 
+
 def bytes_to_base64_url(img_bytes: bytes, mime_type: str) -> str:
     """Конвертирует байты изображения в data-URL формат base64 с предварительным сжатием."""
-    # Сжимаем картинку перед кодированием в Base64
     compressed_bytes = compress_image(img_bytes)
     base64_data = base64.b64encode(compressed_bytes).decode("utf-8")
     # Поскольку мы принудительно сжимаем в JPEG, mime-тип будет image/jpeg
@@ -146,11 +147,11 @@ def estimate_tokens(history: list) -> int:
                     text = part.get("text", "")
                     total_tokens += int(len(text) * 0.85) + 1
                 elif part_type == "image_url":
-                    # Картинки в Gemini в среднем занимают около 258-300 токенов
                     total_tokens += 300
     return total_tokens
 
-def prune_history_local(history: list, max_tokens: int = 1025) -> list:
+
+def prune_history_local(history: list, max_tokens: int = 32001) -> list:
     """
     Удаляет старые сообщения локально, используя быструю оценку токенов.
     """
@@ -186,17 +187,17 @@ def prune_history_local(history: list, max_tokens: int = 1025) -> list:
     if pruned:
         print(f"[PRUNE] Очистка завершена. Было: {initial_tokens} токенов, стало: {final_tokens} токенов.", flush=True)
     else:
-        print(f"[PRUNE_CHECK] Объем контекста в норме ({final_tokens}/{max_tokens} токенов). Очистка не требуется.", flush=True)
+        print(f"[PRUNE_CHECK] Контекст в норме ({final_tokens}/{max_tokens} токенов). Очистка не требуется.", flush=True)
         
     log_last_message(history, "PRUNE_END")
     return history
+
 
 async def generate_content_with_retry(history: list, system_instruction: str, max_retries: int = 3, initial_delay: float = 2.0):
     """
     Обертка для вызова API реселлера с автоповтором при временных ошибках.
     """
     delay = initial_delay
-    # Объединяем системный промпт с историей сообщений
     messages = [{"role": "system", "content": system_instruction}] + history
     
     for attempt in range(max_retries):
@@ -218,10 +219,10 @@ async def generate_content_with_retry(history: list, system_instruction: str, ma
             else:
                 raise e
 
+
 @bot.event
 async def on_ready():
     print(f"Discord-бот {bot.user.name} успешно запущен через API-прокси в сети!", flush=True)
-
 
 
 @bot.command(name="stop")
@@ -235,8 +236,10 @@ async def stop_bot(ctx):
         conversation_histories.pop(context_id, None)  # Полностью удаляем канал из активных
         await ctx.send("Бот успешно остановлен и переведен в спящий режим в этом канале. Логгирование прекращено.")
         print(f"[STOP] Бот остановлен в канале {context_id}", flush=True)
+        log_last_message([], "STOP")
     else:
         await ctx.send("Бот уже находится в спящем режиме в этом канале.")
+
 
 @bot.command(name="show")
 async def show_active_channels(ctx):
@@ -257,6 +260,7 @@ async def show_active_channels(ctx):
             lines.append(f"• Неизвестный канал (ID: {cid})")
             
     await ctx.send("\n".join(lines))
+
 
 @bot.command(name="maxchannels")
 @commands.has_permissions(administrator=True)  # Доступно только администраторам сервера
@@ -294,7 +298,6 @@ async def export_messages(ctx, file_format: str = "txt"):
     file_format = file_format.lower()
 
     if file_format == "json":
-        # Экспорт в структурированный JSON с обрезкой тяжелых картинок
         clean_history = []
         for msg in history:
             role = msg.get("role")
@@ -308,7 +311,6 @@ async def export_messages(ctx, file_format: str = "txt"):
                     if part.get("type") == "text":
                         clean_parts.append(part)
                     elif part.get("type") == "image_url":
-                        # Заменяем тяжелый Base64 код картинки на компактное описание
                         clean_parts.append({
                             "type": "image_url", 
                             "image_url": {"url": "[IMAGE_BASE64_TRUNCATED]"}
@@ -319,7 +321,6 @@ async def export_messages(ctx, file_format: str = "txt"):
         file_data = io.BytesIO(json_data.encode("utf-8"))
         filename = f"chat_history_{context_id}.json"
     else:
-        # Экспорт в красивый читаемый текстовый файл (.txt)
         text_lines = [f"=== ЭКСПОРТ ИСТОРИИ ЧАТА: КАНАЛ '{ctx.channel.name}' ({context_id}) ===\n"]
         
         for idx, msg in enumerate(history, 1):
@@ -337,16 +338,16 @@ async def export_messages(ctx, file_format: str = "txt"):
                         text_lines.append(f"    {part.get('text', '')}")
                     elif part_type == "image_url":
                         text_lines.append("    [Вложенное изображение]")
-                text_lines.append("") # Пустая строка для читаемости между репликами
+                text_lines.append("")
                 
         text_data = "\n".join(text_lines)
         file_data = io.BytesIO(text_data.encode("utf-8"))
         filename = f"chat_history_{context_id}.txt"
 
-    # Отправляем сгенерированный в памяти файл пользователю
     discord_file = discord.File(fp=file_data, filename=filename)
     await ctx.send(content=f"Вот файл с текущей историей сообщений (формат: {file_format.upper()}):", file=discord_file)
     print(f"[EXPORT] Экспортирована история для канала {context_id} в формате {file_format}", flush=True)
+
 
 @bot.command(name="unload")
 async def unload_messages(ctx):
@@ -355,14 +356,13 @@ async def unload_messages(ctx):
     """
     context_id = ctx.channel.id
     
-    # Проверяем, есть ли записанная история для этого канала
     if context_id in conversation_histories and conversation_histories[context_id]:
         conversation_histories[context_id] = []  # Очищаем историю в памяти
         await ctx.send("Память бота для этого канала успешно очищена!")
         print(f"[UNLOAD] Очищен контекст для канала {context_id} ({ctx.channel.name})", flush=True)
+        log_last_message([], "UNLOAD")
     else:
         await ctx.send("Память бота для этого канала уже пуста.")
-
 
 
 @bot.command(name="load")
@@ -380,7 +380,6 @@ async def load_messages(ctx, limit: int = 10):
     context_id = ctx.channel.id
     is_active = context_id in conversation_histories
     
-    # Если канал еще не активен, проверяем лимит перед активацией
     if not is_active:
         if len(conversation_histories) >= max_active_channels:
             await ctx.send(
@@ -444,15 +443,11 @@ async def load_messages(ctx, limit: int = 10):
                 else:
                     new_history.append({"role": "user", "content": content_to_add})
 
-    new_history = prune_history_local(new_history, max_tokens=1025)
+    new_history = prune_history_local(new_history, max_tokens=32001)
     conversation_histories[context_id] = new_history
     
-    # Добавляем логирование загруженного состояния
     log_last_message(new_history, "LOAD_END")
-    
     await status_message.edit(content=f"Успешно загружено и обработано {len(messages)} сообщений в контекст!")
-
-
 
 
 @bot.event
@@ -479,11 +474,11 @@ async def on_message(message):
         except Exception:
             pass
 
-    # СЦЕНАРИЙ 1: Бот спит и пинга нет -> полностью игнорируем сообщение (экономим ресурсы)
+    # СЦЕНАРИЙ 1: Бот спит и пинга нет -> игнорируем
     if not is_active and not (is_pinged or is_reply_to_bot):
         return
 
-    # СЦЕНАРИЙ 2: Бот спит, но его пинганули -> пытаемся разбудить (с проверкой лимита)
+    # СЦЕНАРИЙ 2: Бот спит, но его пинганули -> пытаемся активировать
     if not is_active and (is_pinged or is_reply_to_bot):
         if len(conversation_histories) >= max_active_channels:
             await message.reply(
@@ -492,12 +487,10 @@ async def on_message(message):
             )
             return
         
-        # Просыпаемся: создаем пустую историю для этого канала
         conversation_histories[context_id] = []
         is_active = True
         print(f"[WAKEUP] Бот проснулся в канале {context_id}", flush=True)
 
-    # Сбор реплик и вложений (выполняется только для активных каналов)
     clean_text = message.content.replace(f"<@{bot.user.id}>", "").strip()
     parts = []
     
@@ -543,10 +536,9 @@ async def on_message(message):
         else:
             history.append({"role": "user", "content": content_to_add})
             
-        history = prune_history_local(history, max_tokens=1025)
+        history = prune_history_local(history, max_tokens=32001)
         conversation_histories[context_id] = history
 
-    # Если был пинг или ответ на сообщение бота — генерируем ответ
     if is_pinged or is_reply_to_bot:
         if not conversation_histories[context_id]:
             conversation_histories[context_id] = [
@@ -572,6 +564,9 @@ async def on_message(message):
                 
                 history.append({"role": "assistant", "content": reply_text})
                 conversation_histories[context_id] = history
+                
+                # Вывод в консоль состояния памяти после ответа бота
+                log_last_message(history, "ASSISTANT_REPLY")
 
                 if len(reply_text) > 2000:
                     await message.reply(reply_text[:1900] + "\n\n*(Ответ обрезан из-за лимитов Discord)*")
