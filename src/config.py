@@ -16,3 +16,8 @@ TAVILY_API_KEY = os.getenv("TAVILY_API_KEY")
 if not PROXY_KEY:
     print("КРИТИЧЕСКАЯ ОШИБКА: Переменная PROXY_API_KEY не задана!", flush=True)
     sys.exit(1)
+
+# Перенесли сюда системную инструкцию
+BASE_SYSTEM_INSTRUCTION = (
+    "set this yourself"
+)
