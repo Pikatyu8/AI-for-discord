@@ -1,5 +1,6 @@
 import json
 import io
+import asyncio
 import discord
 from discord.ext import commands
 
@@ -10,7 +11,10 @@ from src.utils import (
     get_normalized_mime_type,
     bytes_to_base64_url,
     prune_history_local,
-    log_last_message
+    log_last_message,
+    extract_image_urls,
+    fetch_image_as_base64,
+    extract_embeds_text
 )
 
 intents = discord.Intents.default()
@@ -23,7 +27,7 @@ bot.conversation_histories = {}
 bot.max_active_channels = 2
 
 BASE_SYSTEM_INSTRUCTION = (
-    "FILL THIS YOURSELF"
+    "set this yourself"
 )
 
 
@@ -106,7 +110,7 @@ async def export_messages(ctx, file_format: str = "txt"):
                             "type": "image_url", 
                             "image_url": {"url": "[IMAGE_BASE64_TRUNCATED]"}
                         })
-                clean_history.append({"role": role, "content": clean_parts})
+                clean_history.append({"role": "role", "content": clean_parts})
 
         json_data = json.dumps(clean_history, ensure_ascii=False, indent=4)
         file_data = io.BytesIO(json_data.encode("utf-8"))
@@ -191,8 +195,18 @@ async def load_messages(ctx, limit: int = 10):
             new_history.append({"role": "assistant", "content": msg.content})
         else:
             clean_text = msg.content.replace(f"<@{bot.user.id}>", "").strip()
+            
+            # Извлекаем текст из эмбедов (постов/ссылок) для истории
+            embeds_text = extract_embeds_text(msg)
+            if embeds_text:
+                if clean_text:
+                    clean_text = f"{clean_text}\n\n[Текст из прикрепленных ссылок/эмбедов]:\n{embeds_text}"
+                else:
+                    clean_text = f"[Текст из прикрепленных ссылок/эмбедов]:\n{embeds_text}"
+            
             parts = []
             
+            # 1. Извлекаем обычные файлы-вложения
             for attachment in msg.attachments:
                 if is_image_attachment(attachment):
                     try:
@@ -204,7 +218,17 @@ async def load_messages(ctx, limit: int = 10):
                             "image_url": {"url": base64_url}
                         })
                     except Exception as e:
-                        print(f"[LOAD] Ошибка загрузки картинки: {e}", flush=True)
+                        print(f"[LOAD] Ошибка загрузки картинки из вложений: {e}", flush=True)
+            
+            # 2. Извлекаем изображения по ссылкам и из эмбедов в истории
+            image_urls = extract_image_urls(msg)
+            for url in image_urls:
+                base64_url = await fetch_image_as_base64(url)
+                if base64_url:
+                    parts.append({
+                        "type": "image_url",
+                        "image_url": {"url": base64_url}
+                    })
                         
             if clean_text:
                 parts.append({
@@ -338,12 +362,30 @@ async def on_message(message):
         is_active = True
         print(f"[WAKEUP] Бот проснулся в канале {context_id}", flush=True)
 
+    # Задержка для того, чтобы Discord успел сгенерировать эмбеды на стороне API
+    if "http://" in message.content or "https://" in message.content:
+        await asyncio.sleep(0.8)
+        try:
+            message = await message.channel.fetch_message(message.id)
+        except Exception:
+            pass
+
     clean_text = message.content.replace(f"<@{bot.user.id}>", "").strip()
+    
+    # Сбор текста из прикреплённых эмбедов и ссылок
+    embeds_text = extract_embeds_text(message)
+    if embeds_text:
+        if clean_text:
+            clean_text = f"{clean_text}\n\n[Текст из прикрепленных ссылок/эмбедов]:\n{embeds_text}"
+        else:
+            clean_text = f"[Текст из прикрепленных ссылок/эмбедов]:\n{embeds_text}"
+            
     parts = []
     
     if message.attachments:
         print(f"[Вложение] Найдено файлов: {len(message.attachments)} в сообщении от {message.author.display_name}", flush=True)
 
+    # 1. Сначала обрабатываем обычные вложенные файлы
     for attachment in message.attachments:
         if is_image_attachment(attachment):
             try:
@@ -357,6 +399,19 @@ async def on_message(message):
                 })
             except Exception as e:
                 print(f"[Вложение] Ошибка при чтении файла {attachment.filename}: {e}", flush=True)
+
+    # 2. Обрабатываем ссылки и эмбеды (извлекаем картинки)
+    image_urls = extract_image_urls(message)
+    if image_urls:
+        print(f"[Ссылки/Эмбеды] Найдено изображений по ссылкам: {len(image_urls)} в сообщении от {message.author.display_name}", flush=True)
+        
+    for url in image_urls:
+        base64_url = await fetch_image_as_base64(url)
+        if base64_url:
+            parts.append({
+                "type": "image_url",
+                "image_url": {"url": base64_url}
+            })
 
     if clean_text:
         parts.append({
