@@ -1,3 +1,5 @@
+--- START OF FILE llm.py ---
+
 import asyncio
 from openai import AsyncOpenAI
 from src.config import PROXY_KEY, PROXY_BASE_URL, MODEL_NAME
@@ -19,6 +21,34 @@ TOOLS = [
                     }
                 },
                 "required": ["query"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "save_note",
+            "description": "Сохранить важную информацию, заметку или воспоминание в текстовый файл memories.txt. Используй этот инструмент, когда пользователь просит тебя что-то запомнить, записать или сохранить.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "text": {
+                        "type": "string",
+                        "description": "Текст заметки или воспоминания для сохранения"
+                    }
+                },
+                "required": ["text"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "read_notes",
+            "description": "Прочитать все ранее сохраненные заметки и воспоминания из файла memories.txt. Используй этот инструмент, когда пользователь спрашивает о том, что ты помнишь, или просит показать сохраненные заметки.",
+            "parameters": {
+                "type": "object",
+                "properties": {}
             }
         }
     }
