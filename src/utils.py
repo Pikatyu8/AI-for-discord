@@ -1,12 +1,13 @@
-
 import io
 import base64
 import httpx
 import re
 import os
+import json
 from datetime import datetime
 
 MEMORIES_FILE = "src/memories.txt"
+CHAT_HISTORY_FILE = "src/chat.txt"
 
 def compress_image(img_bytes: bytes, max_size: int = 1000, quality: int = 70) -> bytes:
     """
@@ -70,6 +71,40 @@ def is_image_attachment(attachment) -> bool:
     if attachment.content_type and attachment.content_type.startswith("image/"):
         return True
     return False
+
+
+def is_text_or_pdf_attachment(attachment) -> bool:
+    """Проверяет, является ли вложение текстовым документом (.txt, .json, .log, .py) или PDF."""
+    filename = attachment.filename.lower()
+    text_extensions = ('.txt', '.json', '.log', '.py', '.pdf')
+    if filename.endswith(text_extensions):
+        return True
+    if attachment.content_type:
+        mime = attachment.content_type.lower()
+        if any(t in mime for t in ["text/", "json", "pdf"]):
+            return True
+    return False
+
+
+def extract_text_from_pdf(pdf_bytes: bytes) -> str:
+    """
+    Извлекает текстовый контент из PDF-документа с помощью библиотеки pypdf.
+    """
+    try:
+        import pypdf
+        reader = pypdf.PdfReader(io.BytesIO(pdf_bytes))
+        text_parts = []
+        for page in reader.pages:
+            page_text = page.extract_text()
+            if page_text:
+                text_parts.append(page_text)
+        return "\n".join(text_parts).strip()
+    except ImportError:
+        print("[PDF] Ошибка: библиотека 'pypdf' не установлена. Используйте `pip install pypdf`.", flush=True)
+        return "[Ошибка: на сервере не установлена библиотека pypdf для парсинга PDF-файлов. Пожалуйста, выполните 'pip install pypdf']"
+    except Exception as e:
+        print(f"[PDF_ERR] Ошибка при извлечении текста из PDF: {e}", flush=True)
+        return f"[Ошибка при чтении PDF-файла: {e}]"
 
 
 def get_normalized_mime_type(attachment) -> str:
@@ -328,3 +363,31 @@ def read_memories() -> str:
     except Exception as e:
         print(f"[MEMORIES] Ошибка чтения файла: {e}", flush=True)
         return "Не удалось прочитать файл заметок."
+
+
+def save_conversations(histories: dict) -> None:
+    """
+    Сохраняет историю диалогов в файл src/chat.txt в формате JSON.
+    """
+    try:
+        os.makedirs(os.path.dirname(CHAT_HISTORY_FILE), exist_ok=True)
+        serialized = {str(k): v for k, v in histories.items()}
+        with open(CHAT_HISTORY_FILE, "w", encoding="utf-8") as f:
+            json.dump(serialized, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        print(f"[SAVE_HIST] Ошибка сохранения истории в {CHAT_HISTORY_FILE}: {e}", flush=True)
+
+
+def load_conversations() -> dict:
+    """
+    Загружает историю диалогов из файла src/chat.txt.
+    """
+    if not os.path.exists(CHAT_HISTORY_FILE):
+        return {}
+    try:
+        with open(CHAT_HISTORY_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return {int(k): v for k, v in data.items()}
+    except Exception as e:
+        print(f"[LOAD_HIST] Ошибка загрузки истории из {CHAT_HISTORY_FILE}: {e}", flush=True)
+        return {}
