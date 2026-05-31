@@ -16,8 +16,8 @@ from src.utils import (
     fetch_image_as_base64,
     extract_embeds_text,
     extract_and_strip_thoughts,
-    append_memory,       # Импортируем добавленные функции
-    read_memories        # Импортируем добавленные функции
+    append_memory,
+    read_memories
 )
 
 intents = discord.Intents.default()
@@ -227,9 +227,21 @@ async def load_messages(ctx, limit: int = 10):
     
     for msg in messages:
         if msg.author == bot.user:
-            new_history.append({"role": "assistant", "content": msg.content})
+            new_history.append({"role": "assistant", "content": msg.clean_content})
         else:
-            clean_text = msg.content.replace(f"<@{bot.user.id}>", "").strip()
+            # Извлекаем очищенный от тегов текст (с именами вместо ID)
+            clean_text = msg.clean_content
+            
+            # Убираем упоминание самого бота
+            bot_mentions = [f"@{bot.user.name}", f"@{bot.user.display_name}"]
+            if msg.guild and msg.guild.me:
+                bot_mentions.append(f"@{msg.guild.me.display_name}")
+                bot_mentions.append(f"@{msg.guild.me.name}")
+                
+            for mention in sorted(list(set(bot_mentions)), key=len, reverse=True):
+                clean_text = clean_text.replace(mention, "")
+            
+            clean_text = clean_text.strip()
             
             embeds_text = extract_embeds_text(msg)
             if embeds_text:
@@ -458,7 +470,19 @@ async def on_message(message):
         except Exception:
             pass
 
-    clean_text = message.content.replace(f"<@{bot.user.id}>", "").strip()
+    # Используем clean_content для автозамены упоминаний <@id> на имена пользователей
+    clean_text = message.clean_content
+    
+    # Фильтруем упоминание самого бота из текста
+    bot_mentions = [f"@{bot.user.name}", f"@{bot.user.display_name}"]
+    if message.guild and message.guild.me:
+        bot_mentions.append(f"@{message.guild.me.display_name}")
+        bot_mentions.append(f"@{message.guild.me.name}")
+        
+    for mention in sorted(list(set(bot_mentions)), key=len, reverse=True):
+        clean_text = clean_text.replace(mention, "")
+        
+    clean_text = clean_text.strip()
     
     embeds_text = extract_embeds_text(message)
     if embeds_text:
