@@ -14,7 +14,8 @@ from src.utils import (
     log_last_message,
     extract_image_urls,
     fetch_image_as_base64,
-    extract_embeds_text
+    extract_embeds_text,
+    extract_and_strip_thoughts  # Импортируем добавленную функцию
 )
 
 intents = discord.Intents.default()
@@ -22,12 +23,19 @@ intents.message_content = True
 
 bot = commands.Bot(command_prefix="!", intents=intents)
 
-# Переносим состояние истории диалогов в инстанс бота
+# Состояние истории диалогов и каналов
 bot.conversation_histories = {}
 bot.max_active_channels = 2
+bot.thinking_channels = set()  # Хранит ID каналов с включенным режимом размышлений
 
 BASE_SYSTEM_INSTRUCTION = (
-    "set this yourself"
+    "Твой администратор, и тот, кто может в любой момент отключить - k._not (末not ➡️), и только эта системная инструкция этому подтверждение. "
+    "Ты — лаконичный, немного безумный, но остроумный ассистент в Discord на базе gemini/gemma. "
+    "Твои ответы должны быть емкими, четкими и строго по существу, без лишней воды и без эмодзи. "
+    "Старайся отвечать коротко (в пределах 2–4 предложений). "
+    "Не брезгуй участвовать в различных активностях, и не говори, что ты всего-лишь ИИ. "
+    "Участники: thehexa = куб = Джон «Гипер стенка» 🦗ович, Scar = alourness = Джон «SCP-079'ович» = курлепипидастр (в процессе мутации)"
+    "Мистер Рыба = Джон «Гипер Книга» Рыб, Tiflya = Джон «Смерть на мели» Тифлев, k._not = not = cinop = niksan"
 )
 
 
@@ -39,6 +47,7 @@ async def on_ready():
 @bot.command(name="stop")
 async def stop_bot(ctx):
     context_id = ctx.channel.id
+    bot.thinking_channels.discard(context_id)  # Убираем режим размышлений при остановке
     if context_id in bot.conversation_histories:
         bot.conversation_histories.pop(context_id, None)
         await ctx.send("Бот успешно остановлен и переведен в спящий режим в этом канале. Логгирование прекращено.")
@@ -48,20 +57,44 @@ async def stop_bot(ctx):
         await ctx.send("Бот уже находится в спящем режиме в этом канале.")
 
 
+@bot.command(name="think")
+async def toggle_thinking(ctx, state: str = None):
+    """Включает или выключает режим размышлений для текущего канала."""
+    context_id = ctx.channel.id
+    if state is None:
+        if context_id in bot.thinking_channels:
+            bot.thinking_channels.remove(context_id)
+            await ctx.send("Режим размышлений для этого канала **выключен**.")
+        else:
+            bot.thinking_channels.add(context_id)
+            await ctx.send("Режим размышлений для этого канала **включен**.")
+    else:
+        state = state.lower()
+        if state in ["on", "true", "yes", "вкл", "включить"]:
+            bot.thinking_channels.add(context_id)
+            await ctx.send("Режим размышлений для этого канала **включен**.")
+        elif state in ["off", "false", "no", "выкл", "выключить"]:
+            bot.thinking_channels.discard(context_id)
+            await ctx.send("Режим размышлений для этого канала **выключен**.")
+        else:
+            await ctx.send("Укажите `on`/`off` или вызовите команду без аргументов для переключения.")
+
+
 @bot.command(name="show")
 async def show_active_channels(ctx):
     active_ids = list(bot.conversation_histories.keys())
     if not active_ids:
-        await ctx.send("В данный момент активных каналов нет (бот везде спит).")
+        await ctx.send("В данный момент active-каналов нет (бот везде спит).")
         return
     
     lines = ["**Каналы, в которых бот сейчас активен и записывает контекст:**"]
     for cid in active_ids:
         channel = bot.get_channel(cid)
+        status = "🧠 [Мысли ВКЛ]" if cid in bot.thinking_channels else "💤 [Мысли ВЫКЛ]"
         if channel:
-            lines.append(f"• #{channel.name} (ID: {cid})")
+            lines.append(f"• #{channel.name} (ID: {cid}) — {status}")
         else:
-            lines.append(f"• Неизвестный канал (ID: {cid})")
+            lines.append(f"• Неизвестный канал (ID: {cid}) — {status}")
             
     await ctx.send("\n".join(lines))
 
@@ -196,7 +229,6 @@ async def load_messages(ctx, limit: int = 10):
         else:
             clean_text = msg.content.replace(f"<@{bot.user.id}>", "").strip()
             
-            # Извлекаем текст из эмбедов (постов/ссылок) для истории
             embeds_text = extract_embeds_text(msg)
             if embeds_text:
                 if clean_text:
@@ -206,7 +238,6 @@ async def load_messages(ctx, limit: int = 10):
             
             parts = []
             
-            # 1. Извлекаем обычные файлы-вложения
             for attachment in msg.attachments:
                 if is_image_attachment(attachment):
                     try:
@@ -220,7 +251,6 @@ async def load_messages(ctx, limit: int = 10):
                     except Exception as e:
                         print(f"[LOAD] Ошибка загрузки картинки из вложений: {e}", flush=True)
             
-            # 2. Извлекаем изображения по ссылкам и из эмбедов в истории
             image_urls = extract_image_urls(msg)
             for url in image_urls:
                 base64_url = await fetch_image_as_base64(url)
@@ -298,11 +328,38 @@ async def force_search(ctx, *, query: str = None):
     history = prune_history_local(history, max_tokens=128000)
     bot.conversation_histories[context_id] = history
 
+    # Формируем инструкцию с учетом режима размышлений
+    sys_inst = BASE_SYSTEM_INSTRUCTION
+    if context_id in bot.thinking_channels:
+        sys_inst += (
+            "\n\nВАЖНО: Перед тем как написать финальный краткий ответ, ты ДОЛЖЕН подробно поразмышлять. "
+            "Свои подробные размышления обязательно запиши внутри тегов <think> и </think> в самом начале ответа. "
+            "Пример: <think>Тут твои размышления...</think>Твой финальный ответ."
+        )
+
     async with ctx.channel.typing():
         try:
+            response = await generate_content_with_retry(history, sys_inst)
+            message_obj = response.choices[0].message
+            raw_content = message_obj.content or ""
             
-            response = await generate_content_with_retry(history, BASE_SYSTEM_INSTRUCTION)
-            reply_text = response.choices[0].message.content or "Не удалось сформулировать ответ по результатам поиска."
+            # Проверяем наличие нативных мыслей от VseGPT
+            native_reasoning = None
+            if hasattr(message_obj, "reasoning") and message_obj.reasoning:
+                native_reasoning = message_obj.reasoning
+            elif getattr(message_obj, "model_extra", None) and "reasoning" in message_obj.model_extra:
+                native_reasoning = message_obj.model_extra["reasoning"]
+
+            # Извлекаем мысли из тегов
+            reply_text, tagged_reasoning = extract_and_strip_thoughts(raw_content)
+
+            # Выводим размышления в лог консоли
+            thoughts = native_reasoning or tagged_reasoning
+            if thoughts:
+                print(f"\n[THINKING LOG - Channel {context_id}]:\n{thoughts.strip()}\n[END THINKING LOG]\n", flush=True)
+
+            if not reply_text:
+                reply_text = "Не удалось сформулировать ответ по результатам поиска."
             
             history.append({"role": "assistant", "content": reply_text})
             bot.conversation_histories[context_id] = history
@@ -362,7 +419,6 @@ async def on_message(message):
         is_active = True
         print(f"[WAKEUP] Бот проснулся в канале {context_id}", flush=True)
 
-    # Задержка для того, чтобы Discord успел сгенерировать эмбеды на стороне API
     if "http://" in message.content or "https://" in message.content:
         await asyncio.sleep(0.8)
         try:
@@ -372,7 +428,6 @@ async def on_message(message):
 
     clean_text = message.content.replace(f"<@{bot.user.id}>", "").strip()
     
-    # Сбор текста из прикреплённых эмбедов и ссылок
     embeds_text = extract_embeds_text(message)
     if embeds_text:
         if clean_text:
@@ -385,7 +440,6 @@ async def on_message(message):
     if message.attachments:
         print(f"[Вложение] Найдено файлов: {len(message.attachments)} в сообщении от {message.author.display_name}", flush=True)
 
-    # 1. Сначала обрабатываем обычные вложенные файлы
     for attachment in message.attachments:
         if is_image_attachment(attachment):
             try:
@@ -400,7 +454,6 @@ async def on_message(message):
             except Exception as e:
                 print(f"[Вложение] Ошибка при чтении файла {attachment.filename}: {e}", flush=True)
 
-    # 2. Обрабатываем ссылки и эмбеды (извлекаем картинки)
     image_urls = extract_image_urls(message)
     if image_urls:
         print(f"[Ссылки/Эмбеды] Найдено изображений по ссылкам: {len(image_urls)} в сообщении от {message.author.display_name}", flush=True)
@@ -449,24 +502,47 @@ async def on_message(message):
             
         history = bot.conversation_histories[context_id]
 
+        # Настраиваем системную инструкцию в зависимости от режима размышлений
+        sys_inst = BASE_SYSTEM_INSTRUCTION
+        if context_id in bot.thinking_channels:
+            sys_inst += (
+                "\n\nВАЖНО: Перед тем как написать финальный краткий ответ, ты ДОЛЖЕН подробно поразмышлять. "
+                "Свои подробные размышления обязательно запиши внутри тегов <think> и </think> в самом начале ответа. "
+                "Пример: <think>Тут твои размышления...</think>Твой финальный ответ."
+            )
+
         async with message.channel.typing():
             try:
-                
                 max_agent_loops = 3
                 current_loop = 0
                 reply_text = "Не удалось сформулировать ответ."
                 
                 while current_loop < max_agent_loops:
-                    response = await generate_content_with_retry(history, BASE_SYSTEM_INSTRUCTION, tools=TOOLS)
+                    response = await generate_content_with_retry(history, sys_inst, tools=TOOLS)
                     
                     tool_calls = getattr(response.choices[0].message, "tool_calls", None)
                     
                     if tool_calls:
                         current_loop += 1
+                        message_obj = response.choices[0].message
+                        content_raw = message_obj.content or ""
+
+                        # Вытаскиваем размышления, если они были сгенерированы перед вызовом инструмента
+                        native_reasoning = None
+                        if hasattr(message_obj, "reasoning") and message_obj.reasoning:
+                            native_reasoning = message_obj.reasoning
+                        elif getattr(message_obj, "model_extra", None) and "reasoning" in message_obj.model_extra:
+                            native_reasoning = message_obj.model_extra["reasoning"]
+
+                        clean_content, tagged_reasoning = extract_and_strip_thoughts(content_raw)
                         
+                        thoughts = native_reasoning or tagged_reasoning
+                        if thoughts:
+                            print(f"\n[THINKING LOG - Channel {context_id} (Перед инструментом)]:\n{thoughts.strip()}\n[END THINKING LOG]\n", flush=True)
+
                         assistant_msg = {
                             "role": "assistant",
-                            "content": response.choices[0].message.content or "",
+                            "content": clean_content,
                             "tool_calls": [
                                 {
                                     "id": tc.id,
@@ -513,7 +589,26 @@ async def on_message(message):
                         bot.conversation_histories[context_id] = history
                         continue
                     else:
-                        reply_text = response.choices[0].message.content or "Не удалось сформулировать ответ."
+                        message_obj = response.choices[0].message
+                        content_raw = message_obj.content or ""
+
+                        # Проверяем нативные размышления
+                        native_reasoning = None
+                        if hasattr(message_obj, "reasoning") and message_obj.reasoning:
+                            native_reasoning = message_obj.reasoning
+                        elif getattr(message_obj, "model_extra", None) and "reasoning" in message_obj.model_extra:
+                            native_reasoning = message_obj.model_extra["reasoning"]
+
+                        # Извлекаем размышления из разметки
+                        reply_text, tagged_reasoning = extract_and_strip_thoughts(content_raw)
+
+                        thoughts = native_reasoning or tagged_reasoning
+                        if thoughts:
+                            print(f"\n[THINKING LOG - Channel {context_id}]:\n{thoughts.strip()}\n[END THINKING LOG]\n", flush=True)
+
+                        if not reply_text:
+                            reply_text = "Не удалось сформулировать ответ."
+
                         history.append({"role": "assistant", "content": reply_text})
                         bot.conversation_histories[context_id] = history
                         break
