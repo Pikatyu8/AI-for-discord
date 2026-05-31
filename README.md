@@ -8,12 +8,13 @@ To make this work, you need:
 6. Go to [discloud.com](https://discloud.com/), log in, add your bot, and upload the created `.zip` archive.
 7. Done! The bot should start up and respond to your mentions and commands.
 8. Bot commands:
-- !load n - loads n messages in the chat, up to 201
-- !unload - unloads all messages from the chat
-- !export | json - shows the bot's chat history (can be run with the json parameter)
-- !show - shows where the bot is active
-- !stop - pauses message recording in the channel
-- !maxchannels n - sets the maximum number of active channels for the bot (default is 2)
+- - !load n - loads n messages in the chat, up to 201
+- - !unload - unloads all messages from the chat
+- - !export | json - shows the bot's chat history (can be run with the json parameter)
+- - !show - shows where the bot is active
+- - !stop - pauses message recording in the channel
+- - !maxchannels n - sets the maximum number of active channels for the bot (default is 2)
+- - !think on/off - switches the model's thinking mode
 
 ---
 
@@ -33,3 +34,4 @@ To make this work, you need:
 - - !show - показывает, где активен бот
 - - !stop - приостанавливает запись сообщений в канале
 - - !maxchannels n - задает максимум активных каналов для бота (по умолчанию 2)
+- - !think on/off - переключает режим размышлений модели
