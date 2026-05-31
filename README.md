@@ -15,6 +15,8 @@ To make this work, you need:
 - - !stop - pauses message recording in the channel
 - - !maxchannels n - sets the maximum number of active channels for the bot (default is 2)
 - - !think on/off - switches the model's thinking mode
+- - !note - creates a note
+- - !notes - view notes
 
 ---
 
@@ -35,3 +37,5 @@ To make this work, you need:
 - - !stop - приостанавливает запись сообщений в канале
 - - !maxchannels n - задает максимум активных каналов для бота (по умолчанию 2)
 - - !think on/off - переключает режим размышлений модели
+- - !note - создает записку
+- - !notes - просмотреть записи
