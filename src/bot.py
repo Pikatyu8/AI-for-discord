@@ -15,7 +15,9 @@ from src.utils import (
     extract_image_urls,
     fetch_image_as_base64,
     extract_embeds_text,
-    extract_and_strip_thoughts  # Импортируем добавленную функцию
+    extract_and_strip_thoughts,
+    append_memory,       # Импортируем добавленные функции
+    read_memories        # Импортируем добавленные функции
 )
 
 intents = discord.Intents.default()
@@ -381,6 +383,36 @@ async def force_search(ctx, *, query: str = None):
             await ctx.reply("Не удалось обработать запрос после поиска. Пожалуйста, попробуйте еще раз.")
 
 
+@bot.command(name="note")
+async def add_note_cmd(ctx, *, text: str = None):
+    """Быстрое сохранение текстовой заметки на диск напрямую."""
+    if not text:
+        await ctx.send("Укажите текст заметки. Пример: `!note купить хлеб`")
+        return
+    try:
+        append_memory(f"({ctx.author.display_name}): {text}")
+        await ctx.send("Заметка сохранена в `src/memories.txt`!")
+    except Exception as e:
+        print(f"[CMD_NOTE_ERR] {e}", flush=True)
+        await ctx.send("Не удалось сохранить заметку из-за технической ошибки.")
+
+
+@bot.command(name="notes")
+async def read_notes_cmd(ctx):
+    """Вывод всех ранее сохраненных заметок с диска."""
+    try:
+        notes = read_memories()
+        if len(notes) > 1900:
+            file_data = io.BytesIO(notes.encode("utf-8"))
+            discord_file = discord.File(fp=file_data, filename="memories.txt")
+            await ctx.send("Файл заметок слишком большой. Вот файл с диска:", file=discord_file)
+        else:
+            await ctx.send(f"**Содержимое `src/memories.txt`:**\n```\n{notes}\n```")
+    except Exception as e:
+        print(f"[CMD_NOTES_ERR] {e}", flush=True)
+        await ctx.send("Не удалось прочитать файл заметок.")
+
+
 @bot.event
 async def on_message(message):
     if message.author == bot.user:
@@ -557,6 +589,7 @@ async def on_message(message):
                         history.append(assistant_msg)
                         
                         for tool_call in tool_calls:
+                            # 1. Поиск в сети
                             if tool_call.function.name == "web_search":
                                 try:
                                     args = json.loads(tool_call.function.arguments)
@@ -570,7 +603,6 @@ async def on_message(message):
                                 print(f"[TOOL_CALL] Запрос поиска в сети: \"{search_query}\"", flush=True)
                                 
                                 status_msg = await message.reply(f"🔍 Ищу в сети: *{search_query}*...")
-                                
                                 search_results = await perform_search_async(search_query)
                                 
                                 try:
@@ -583,6 +615,41 @@ async def on_message(message):
                                     "tool_call_id": tool_call.id,
                                     "name": "web_search",
                                     "content": json.dumps(search_results, ensure_ascii=False)
+                                }
+                                history.append(tool_msg)
+
+                            # 2. Сохранение заметок
+                            elif tool_call.function.name == "save_note":
+                                try:
+                                    args = json.loads(tool_call.function.arguments)
+                                except Exception:
+                                    args = {"text": tool_call.function.arguments}
+                                
+                                note_text = args.get("text", "")
+                                if note_text:
+                                    append_memory(f"({message.author.display_name} через ИИ): {note_text}")
+                                    tool_result = "Заметка успешно сохранена на диске."
+                                else:
+                                    tool_result = "Ошибка: текст заметки оказался пустым."
+
+                                print(f"[TOOL_CALL] Сохранение заметки: \"{note_text}\"", flush=True)
+                                tool_msg = {
+                                    "role": "tool",
+                                    "tool_call_id": tool_call.id,
+                                    "name": "save_note",
+                                    "content": tool_result
+                                }
+                                history.append(tool_msg)
+
+                            # 3. Чтение заметок
+                            elif tool_call.function.name == "read_notes":
+                                print(f"[TOOL_CALL] Чтение сохраненных заметок из memories.txt", flush=True)
+                                notes_content = read_memories()
+                                tool_msg = {
+                                    "role": "tool",
+                                    "tool_call_id": tool_call.id,
+                                    "name": "read_notes",
+                                    "content": notes_content
                                 }
                                 history.append(tool_msg)
                         
