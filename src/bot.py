@@ -17,7 +17,11 @@ from src.utils import (
     extract_embeds_text,
     extract_and_strip_thoughts,
     append_memory,
-    read_memories
+    read_memories,
+    save_conversations,
+    load_conversations,
+    is_text_or_pdf_attachment,
+    extract_text_from_pdf
 )
 from src.commands import setup as setup_commands
 
@@ -26,8 +30,8 @@ intents.message_content = True
 
 bot = commands.Bot(command_prefix="!", intents=intents)
 
-# Состояние истории диалогов и каналов
-bot.conversation_histories = {}
+# Состояние истории диалогов и каналов (загружается из файла)
+bot.conversation_histories = load_conversations()
 bot.max_active_channels = 2
 bot.thinking_channels = set()  # Хранит ID каналов с включенным режимом размышлений
 
@@ -81,6 +85,7 @@ async def on_message(message):
         
         bot.conversation_histories[context_id] = []
         is_active = True
+        save_conversations(bot.conversation_histories)
         print(f"[WAKEUP] Бот проснулся в канале {context_id}", flush=True)
 
     if "http://" in message.content or "https://" in message.content:
@@ -129,6 +134,23 @@ async def on_message(message):
                 })
             except Exception as e:
                 print(f"[Вложение] Ошибка при чтении файла {attachment.filename}: {e}", flush=True)
+        elif is_text_or_pdf_attachment(attachment):
+            try:
+                file_bytes = await attachment.read()
+                filename = attachment.filename
+                
+                if filename.lower().endswith('.pdf'):
+                    content = extract_text_from_pdf(file_bytes)
+                else:
+                    content = file_bytes.decode("utf-8", errors="ignore")
+                
+                parts.append({
+                    "type": "text",
+                    "text": f"\n[Содержимое файла '{filename}']:\n{content}\n[Конец файла '{filename}']\n"
+                })
+                print(f"[Вложение] Успешно прочитан файл: {filename}", flush=True)
+            except Exception as e:
+                print(f"[Вложение] Ошибка при чтении документа {attachment.filename}: {e}", flush=True)
 
     image_urls = extract_image_urls(message)
     if image_urls:
@@ -169,12 +191,14 @@ async def on_message(message):
             
         history = prune_history_local(history, max_tokens=128000)
         bot.conversation_histories[context_id] = history
+        save_conversations(bot.conversation_histories)
 
     if is_pinged or is_reply_to_bot:
         if not bot.conversation_histories[context_id]:
             bot.conversation_histories[context_id] = [
                 {"role": "user", "content": f"{message.author.display_name}: Привет"}
             ]
+            save_conversations(bot.conversation_histories)
             
         history = bot.conversation_histories[context_id]
 
@@ -298,6 +322,7 @@ async def on_message(message):
                                 history.append(tool_msg)
                         
                         bot.conversation_histories[context_id] = history
+                        save_conversations(bot.conversation_histories)
                         continue
                     else:
                         message_obj = response.choices[0].message
@@ -322,6 +347,7 @@ async def on_message(message):
 
                         history.append({"role": "assistant", "content": reply_text})
                         bot.conversation_histories[context_id] = history
+                        save_conversations(bot.conversation_histories)
                         break
                 
                 log_last_message(history, "ASSISTANT_REPLY")
