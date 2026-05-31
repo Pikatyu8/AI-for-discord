@@ -17,7 +17,10 @@ from src.utils import (
     extract_embeds_text,
     extract_and_strip_thoughts,
     append_memory,
-    read_memories
+    read_memories,
+    save_conversations,
+    is_text_or_pdf_attachment,
+    extract_text_from_pdf
 )
 
 class BotCommands(commands.Cog):
@@ -30,6 +33,7 @@ class BotCommands(commands.Cog):
         self.bot.thinking_channels.discard(context_id)
         if context_id in self.bot.conversation_histories:
             self.bot.conversation_histories.pop(context_id, None)
+            save_conversations(self.bot.conversation_histories)
             await ctx.send("Бот успешно остановлен и переведен в спящий режим в этом канале. Логгирование прекращено.")
             print(f"[STOP] Бот остановлен в канале {context_id}", flush=True)
             log_last_message([], "STOP")
@@ -158,6 +162,7 @@ class BotCommands(commands.Cog):
         
         if context_id in self.bot.conversation_histories and self.bot.conversation_histories[context_id]:
             self.bot.conversation_histories[context_id] = []
+            save_conversations(self.bot.conversation_histories)
             await ctx.send("Память бота для этого канала успешно очищена!")
             print(f"[UNLOAD] Очищен контекст для канала {context_id} ({ctx.channel.name})", flush=True)
             log_last_message([], "UNLOAD")
@@ -169,8 +174,8 @@ class BotCommands(commands.Cog):
         if limit <= 0:
             await ctx.send("Укажите число больше 0.")
             return
-        if limit > 201:
-            await ctx.send("Лимит загрузки за один раз — 201 сообщение.")
+        if limit > 401:
+            await ctx.send("Лимит загрузки за один раз — 401 сообщение.")
             return
 
         context_id = ctx.channel.id
@@ -234,6 +239,21 @@ class BotCommands(commands.Cog):
                             })
                         except Exception as e:
                             print(f"[LOAD] Ошибка загрузки картинки из вложений: {e}", flush=True)
+                    elif is_text_or_pdf_attachment(attachment):
+                        try:
+                            file_bytes = await attachment.read()
+                            filename = attachment.filename
+                            if filename.lower().endswith('.pdf'):
+                                content = extract_text_from_pdf(file_bytes)
+                            else:
+                                content = file_bytes.decode("utf-8", errors="ignore")
+                            
+                            parts.append({
+                                "type": "text",
+                                "text": f"\n[Содержимое файла '{filename}']:\n{content}\n[Конец файла '{filename}']\n"
+                            })
+                        except Exception as e:
+                            print(f"[LOAD] Ошибка чтения документа {attachment.filename}: {e}", flush=True)
                 
                 image_urls = extract_image_urls(msg)
                 for url in image_urls:
@@ -268,6 +288,7 @@ class BotCommands(commands.Cog):
 
         new_history = prune_history_local(new_history, max_tokens=128000)
         self.bot.conversation_histories[context_id] = new_history
+        save_conversations(self.bot.conversation_histories)
         
         log_last_message(new_history, "LOAD_END")
         await status_message.edit(content=f"Успешно загружено и обработано {len(messages)} сообщений в контекст!")
@@ -290,6 +311,7 @@ class BotCommands(commands.Cog):
                 return
             self.bot.conversation_histories[context_id] = []
             is_active = True
+            save_conversations(self.bot.conversation_histories)
             print(f"[WAKEUP-SEARCH] Бот проснулся по команде поиска в канале {context_id}", flush=True)
 
         status_msg = await ctx.send(f"🔍 Выполняю принудительный поиск в сети по запросу: *{query}*...")
@@ -310,6 +332,7 @@ class BotCommands(commands.Cog):
         history.append({"role": "user", "content": search_prompt})
         history = prune_history_local(history, max_tokens=128000)
         self.bot.conversation_histories[context_id] = history
+        save_conversations(self.bot.conversation_histories)
 
         # Инструкция с учетом режима размышлений
         sys_inst = BASE_SYSTEM_INSTRUCTION
@@ -346,6 +369,7 @@ class BotCommands(commands.Cog):
                 
                 history.append({"role": "assistant", "content": reply_text})
                 self.bot.conversation_histories[context_id] = history
+                save_conversations(self.bot.conversation_histories)
                 
                 log_last_message(history, "SEARCH_REPLY")
 
