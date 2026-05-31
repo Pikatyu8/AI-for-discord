@@ -1,4 +1,3 @@
---- START OF FILE utils.py ---
 
 import io
 import base64
