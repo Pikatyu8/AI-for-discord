@@ -271,3 +271,30 @@ def prune_history_local(history: list, max_tokens: int = 128000) -> list:
         
     log_last_message(history, "PRUNE_END")
     return history
+
+
+def extract_and_strip_thoughts(content: str) -> tuple[str, str | None]:
+    """
+    Извлекает размышления из тегов <think>...</think> или <thought>...</thought>,
+    возвращая очищенный текст и сами размышления.
+    """
+    if not content:
+        return "", None
+        
+    thinking = None
+    
+    # Поиск полных тегов
+    match = re.search(r'<(think|thought)>(.*?)</\1>', content, re.DOTALL | re.IGNORECASE)
+    if match:
+        thinking = match.group(2).strip()
+        clean_content = re.sub(r'<(think|thought)>.*?</\1>', '', content, flags=re.DOTALL | re.IGNORECASE).strip()
+    else:
+        # Резервный поиск на случай, если ответ оборвался по лимиту без закрывающего тега
+        open_match = re.search(r'<(think|thought)>(.*)', content, re.DOTALL | re.IGNORECASE)
+        if open_match:
+            thinking = open_match.group(2).strip()
+            clean_content = re.sub(r'<(think|thought)>.*', '', content, flags=re.DOTALL | re.IGNORECASE).strip()
+        else:
+            clean_content = content
+            
+    return clean_content, thinking
