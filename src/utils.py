@@ -1,5 +1,7 @@
 import io
 import base64
+import httpx
+import re
 
 def compress_image(img_bytes: bytes, max_size: int = 1000, quality: int = 70) -> bytes:
     """
@@ -90,6 +92,114 @@ def bytes_to_base64_url(img_bytes: bytes, mime_type: str) -> str:
     compressed_bytes = compress_image(img_bytes)
     base64_data = base64.b64encode(compressed_bytes).decode("utf-8")
     return f"data:image/jpeg;base64,{base64_data}"
+
+
+# Регулярное выражение для поиска ссылок с расширениями изображений в тексте
+IMAGE_URL_REGEX = re.compile(
+    r'https?://[^\s/$.?#].[^\s]*\.(?:png|jpg|jpeg|webp|gif|bmp)(?:\?[^\s]*)?', 
+    re.IGNORECASE
+)
+
+
+def extract_image_urls(message) -> list:
+    """
+    Извлекает уникальные ссылки на изображения как из текста сообщения, так и из эмбедов.
+    """
+    urls = []
+    
+    # 1. Поиск прямых ссылок на картинки в тексте сообщения
+    if message.content:
+        found_urls = IMAGE_URL_REGEX.findall(message.content)
+        for url in found_urls:
+            if url not in urls:
+                urls.append(url)
+                
+    # 2. Поиск изображений внутри сгенерированных Discord-эмбедов (включая превью ссылок)
+    if message.embeds:
+        for embed in message.embeds:
+            if embed.image and embed.image.url:
+                if embed.image.url not in urls:
+                    urls.append(embed.image.url)
+            elif embed.thumbnail and embed.thumbnail.url:
+                if embed.thumbnail.url not in urls:
+                    urls.append(embed.thumbnail.url)
+                    
+    return urls
+
+
+def extract_embeds_text(message) -> str:
+    """
+    Собирает текстовый контент из эмбедов сообщения (заголовки, описания, поля, авторы).
+    """
+    if not message.embeds:
+        return ""
+        
+    embed_texts = []
+    for idx, embed in enumerate(message.embeds, 1):
+        parts = []
+        
+        # Проверяем наличие текстовых полей, игнорируя эмбеды, содержащие исключительно медиафайлы
+        if embed.author and embed.author.name:
+            parts.append(f"Автор: {embed.author.name}")
+        if embed.title:
+            parts.append(f"Заголовок: {embed.title}")
+        if embed.description:
+            parts.append(f"Описание: {embed.description}")
+            
+        for field in embed.fields:
+            if field.name and field.value:
+                parts.append(f"{field.name}: {field.value}")
+                
+        if embed.footer and embed.footer.text:
+            parts.append(f"Подвал: {embed.footer.text}")
+            
+        if parts:
+            embed_texts.append(f"--- Информация из прикреплённой ссылки #{idx} ---\n" + "\n".join(parts))
+            
+    return "\n\n".join(embed_texts)
+
+
+async def fetch_image_as_base64(url: str) -> str:
+    """
+    Асинхронно скачивает изображение по ссылке, сжимает его и кодирует в Base64.
+    """
+    try:
+        async with httpx.AsyncClient() as client:
+            # Сначала пытаемся отправить быстрый HEAD-запрос для предварительной проверки
+            try:
+                head_resp = await client.head(url, timeout=5.0, follow_redirects=True)
+                if head_resp.status_code == 200:
+                    content_type = head_resp.headers.get("content-type", "").lower()
+                    if content_type and "image" not in content_type:
+                        return None
+                    
+                    content_length = head_resp.headers.get("content-length")
+                    if content_length and int(content_length) > 20 * 1024 * 1024:
+                        print(f"[FETCH_IMAGE] Отмена скачивания. Файл по ссылке превышает лимит в 20МБ.", flush=True)
+                        return None
+            except Exception:
+                # Если сервер не поддерживает HEAD-запрос, переходим сразу к GET
+                pass
+
+            response = await client.get(url, timeout=10.0, follow_redirects=True)
+            if response.status_code == 200:
+                real_content_type = response.headers.get("content-type", "").lower()
+                if "image" not in real_content_type:
+                    return None
+                    
+                mime_type = "image/jpeg"
+                if "png" in real_content_type:
+                    mime_type = "image/png"
+                elif "webp" in real_content_type:
+                    mime_type = "image/webp"
+                elif "gif" in real_content_type:
+                    mime_type = "image/gif"
+                
+                img_bytes = response.content
+                return bytes_to_base64_url(img_bytes, mime_type)
+    except Exception as e:
+        print(f"[FETCH_IMAGE] Ошибка скачивания изображения по ссылке {url}: {e}", flush=True)
+    return None
 
 
 def estimate_tokens(history: list) -> int:
