@@ -1,7 +1,13 @@
+--- START OF FILE utils.py ---
+
 import io
 import base64
 import httpx
 import re
+import os
+from datetime import datetime
+
+MEMORIES_FILE = "src/memories.txt"
 
 def compress_image(img_bytes: bytes, max_size: int = 1000, quality: int = 70) -> bytes:
     """
@@ -298,3 +304,28 @@ def extract_and_strip_thoughts(content: str) -> tuple[str, str | None]:
             clean_content = content
             
     return clean_content, thinking
+
+
+def append_memory(text: str) -> None:
+    """
+    Добавляет заметку в memories.txt с отметкой времени.
+    """
+    os.makedirs(os.path.dirname(MEMORIES_FILE), exist_ok=True)
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    with open(MEMORIES_FILE, "a", encoding="utf-8") as f:
+        f.write(f"[{timestamp}] {text}\n")
+
+
+def read_memories() -> str:
+    """
+    Возвращает все сохраненные заметки из memories.txt.
+    """
+    if not os.path.exists(MEMORIES_FILE):
+        return "Заметок пока нет."
+    try:
+        with open(MEMORIES_FILE, "r", encoding="utf-8") as f:
+            content = f.read().strip()
+            return content if content else "Файл заметок пуст."
+    except Exception as e:
+        print(f"[MEMORIES] Ошибка чтения файла: {e}", flush=True)
+        return "Не удалось прочитать файл заметок."
