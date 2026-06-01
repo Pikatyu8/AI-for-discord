@@ -6,7 +6,8 @@ import os
 import json
 from datetime import datetime
 
-MEMORIES_FILE = "src/memories.txt"
+MEMORIES_FILE = "src/memories.json"
+SEARCH_LIMITS_FILE = "src/search_limits.json"
 CHAT_HISTORY_FILE = "src/chat.txt"
 
 def compress_image(img_bytes: bytes, max_size: int = 1000, quality: int = 70) -> bytes:
@@ -18,11 +19,9 @@ def compress_image(img_bytes: bytes, max_size: int = 1000, quality: int = 70) ->
         
         image = Image.open(io.BytesIO(img_bytes))
         
-        # Конвертируем RGBA/P в RGB для сохранения в формате JPEG
         if image.mode in ("RGBA", "P"):
             image = image.convert("RGB")
         
-        # Уменьшаем разрешение, сохраняя пропорции
         image.thumbnail((max_size, max_size))
         
         output = io.BytesIO()
@@ -134,7 +133,6 @@ def bytes_to_base64_url(img_bytes: bytes, mime_type: str) -> str:
     return f"data:image/jpeg;base64,{base64_data}"
 
 
-# Регулярное выражение для поиска ссылок с расширениями изображений в тексте
 IMAGE_URL_REGEX = re.compile(
     r'https?://[^\s/$.?#].[^\s]*\.(?:png|jpg|jpeg|webp|gif|bmp)(?:\?[^\s]*)?', 
     re.IGNORECASE
@@ -146,15 +144,12 @@ def extract_image_urls(message) -> list:
     Извлекает уникальные ссылки на изображения как из текста сообщения, так и из эмбедов.
     """
     urls = []
-    
-    # 1. Поиск прямых ссылок на картинки в тексте сообщения
     if message.content:
         found_urls = IMAGE_URL_REGEX.findall(message.content)
         for url in found_urls:
             if url not in urls:
                 urls.append(url)
                 
-    # 2. Поиск изображений внутри сгенерированных Discord-эмбедов (включая превью ссылок)
     if message.embeds:
         for embed in message.embeds:
             if embed.image and embed.image.url:
@@ -177,8 +172,6 @@ def extract_embeds_text(message) -> str:
     embed_texts = []
     for idx, embed in enumerate(message.embeds, 1):
         parts = []
-        
-        # Проверяем наличие текстовых полей, игнорируя эмбеды, содержащие исключительно медиафайлы
         if embed.author and embed.author.name:
             parts.append(f"Автор: {embed.author.name}")
         if embed.title:
@@ -205,20 +198,17 @@ async def fetch_image_as_base64(url: str) -> str:
     """
     try:
         async with httpx.AsyncClient() as client:
-            # Сначала пытаемся отправить быстрый HEAD-запрос для предварительной проверки
             try:
                 head_resp = await client.head(url, timeout=5.0, follow_redirects=True)
                 if head_resp.status_code == 200:
                     content_type = head_resp.headers.get("content-type", "").lower()
-                    if content_type and "image" not in content_type:
+                    if "image" not in content_type:
                         return None
                     
                     content_length = head_resp.headers.get("content-length")
                     if content_length and int(content_length) > 20 * 1024 * 1024:
-                        print(f"[FETCH_IMAGE] Отмена скачивания. Файл по ссылке превышает лимит в 20МБ.", flush=True)
                         return None
             except Exception:
-                # Если сервер не поддерживает HEAD-запрос, переходим сразу к GET
                 pass
 
             response = await client.get(url, timeout=10.0, follow_redirects=True)
@@ -246,7 +236,7 @@ def estimate_tokens(history: list) -> int:
     """
     Быстро и надежно оценивает объем контекста локально в памяти.
     """
-    total_tokens = 350  # Базовый запас под системный промпт
+    total_tokens = 350
     for msg in history:
         content = msg.get("content") or ""
         if isinstance(content, str):
@@ -290,24 +280,19 @@ def prune_history_local(history: list, max_tokens: int = 128000) -> list:
         
         if isinstance(content, list) and len(content) > 1:
             content.pop(0)
-            print("[PRUNE] Удалено одно сообщение из объединенного блока пользователя.", flush=True)
         else:
             if len(history) >= 2:
                 history.pop(0)
                 history.pop(0)
             else:
                 history.pop(0)
-            print("[PRUNE] Удален полный шаг диалога.", flush=True)
             
-    # Гарантируем, что история не начнется с технического ответа ассистента или инструмента
     while history and history[0].get("role") in ["assistant", "tool"]:
         history.pop(0)
         
     final_tokens = estimate_tokens(history)
     if pruned:
         print(f"[PRUNE] Очистка завершена. Было: {initial_tokens} токенов, стало: {final_tokens} токенов.", flush=True)
-    else:
-        print(f"[PRUNE_CHECK] Контекст в норме ({final_tokens}/{max_tokens} токенов). Очистка не требуется.", flush=True)
         
     log_last_message(history, "PRUNE_END")
     return history
@@ -315,21 +300,17 @@ def prune_history_local(history: list, max_tokens: int = 128000) -> list:
 
 def extract_and_strip_thoughts(content: str) -> tuple[str, str | None]:
     """
-    Извлекает размышления из тегов <think>...</think> или <thought>...</thought>,
-    возвращая очищенный текст и сами размышления.
+    Извлекает размышления из тегов <think>...</think>, возвращая очищенный текст и сами размышления.
     """
     if not content:
         return "", None
         
     thinking = None
-    
-    # Поиск полных тегов
     match = re.search(r'<(think|thought)>(.*?)</\1>', content, re.DOTALL | re.IGNORECASE)
     if match:
         thinking = match.group(2).strip()
         clean_content = re.sub(r'<(think|thought)>.*?</\1>', '', content, flags=re.DOTALL | re.IGNORECASE).strip()
     else:
-        # Резервный поиск на случай, если ответ оборвался по лимиту без закрывающего тега
         open_match = re.search(r'<(think|thought)>(.*)', content, re.DOTALL | re.IGNORECASE)
         if open_match:
             thinking = open_match.group(2).strip()
@@ -340,29 +321,165 @@ def extract_and_strip_thoughts(content: str) -> tuple[str, str | None]:
     return clean_content, thinking
 
 
-def append_memory(text: str) -> None:
+def load_memories_data() -> dict:
     """
-    Добавляет заметку в memories.txt с отметкой времени.
-    """
-    os.makedirs(os.path.dirname(MEMORIES_FILE), exist_ok=True)
-    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    with open(MEMORIES_FILE, "a", encoding="utf-8") as f:
-        f.write(f"[{timestamp}] {text}\n")
-
-
-def read_memories() -> str:
-    """
-    Возвращает все сохраненные заметки из memories.txt.
+    Загружает JSON со всеми заметками и системными промптами.
+    Поддерживает обратную совместимость со старыми плоскими файлами memories.json.
     """
     if not os.path.exists(MEMORIES_FILE):
-        return "Заметок пока нет."
+        return {"notes": {}, "system_instructions": {}}
     try:
         with open(MEMORIES_FILE, "r", encoding="utf-8") as f:
-            content = f.read().strip()
-            return content if content else "Файл заметок пуст."
+            data = json.load(f)
+            if isinstance(data, dict) and "notes" not in data and "system_instructions" not in data:
+                return {"notes": data, "system_instructions": {}}
+            return data
     except Exception as e:
-        print(f"[MEMORIES] Ошибка чтения файла: {e}", flush=True)
-        return "Не удалось прочитать файл заметок."
+        print(f"[MEMORIES] Ошибка загрузки: {e}", flush=True)
+        return {"notes": {}, "system_instructions": {}}
+
+
+def save_memories_data(data: dict) -> None:
+    """Сохраняет структуру заметок и системных инструкций в JSON."""
+    try:
+        os.makedirs(os.path.dirname(MEMORIES_FILE), exist_ok=True)
+        with open(MEMORIES_FILE, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        print(f"[MEMORIES] Ошибка сохранения: {e}", flush=True)
+
+
+def append_memory(server_id: str, text: str, is_manual: bool = False) -> bool:
+    """
+    Добавляет заметку для конкретного сервера.
+    """
+    from src.config import get_server_limits
+    
+    try:
+        guild_id = int(server_id) if server_id.isdigit() else None
+    except ValueError:
+        guild_id = None
+        
+    limits = get_server_limits(guild_id)
+    data = load_memories_data()
+    
+    notes_dict = data.setdefault("notes", {})
+    server_str = str(server_id)
+    if server_str not in notes_dict:
+        notes_dict[server_str] = []
+        
+    server_notes = notes_dict[server_str]
+    
+    # БЕЗОПАСНАЯ проверка типа (пропускает старые строки без вызова исключения AttributeError)
+    auto_notes_count = sum(
+        1 for n in server_notes 
+        if isinstance(n, dict) and not n.get("is_manual", False)
+    )
+    
+    if not is_manual and auto_notes_count >= limits["max_tool_notes"]:
+        print(f"[MEMORIES] Сервер {server_id} превысил лимит авто-заметок ({limits['max_tool_notes']})", flush=True)
+        return False
+        
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    server_notes.append({
+        "timestamp": timestamp,
+        "text": text,
+        "is_manual": is_manual
+    })
+    save_memories_data(data)
+    return True
+
+
+def read_memories(server_id: str) -> str:
+    """
+    Возвращает все сохраненные заметки для указанного сервера.
+    """
+    data = load_memories_data()
+    notes_dict = data.get("notes", {})
+    server_str = str(server_id)
+    if server_str not in notes_dict or not notes_dict[server_str]:
+        return "Заметок пока нет."
+        
+    lines = []
+    for n in notes_dict[server_str]:
+        if isinstance(n, dict):
+            note_prefix = "[Ручная]" if n.get("is_manual", False) else "[Авто]"
+            lines.append(f"[{n['timestamp']}] {note_prefix} {n['text']}")
+        elif isinstance(n, str):
+            # Безопасно выводим старые записи, сохраненные как обычные строки
+            lines.append(n)
+    return "\n".join(lines)
+
+
+def get_custom_system_instruction(server_id: str) -> str | None:
+    """Возвращает кастомную системную инструкцию для сервера из memories.json."""
+    data = load_memories_data()
+    return data.get("system_instructions", {}).get(str(server_id))
+
+
+def set_custom_system_instruction(server_id: str, instruction: str | None) -> None:
+    """Задает или сбрасывает кастомную системную инструкцию для сервера в memories.json."""
+    data = load_memories_data()
+    instructions = data.setdefault("system_instructions", {})
+    
+    server_str = str(server_id)
+    if instruction is None:
+        instructions.pop(server_str, None)
+    else:
+        instructions[server_str] = instruction
+        
+    save_memories_data(data)
+
+
+def check_and_increment_search(server_id: str) -> bool:
+    """
+    Проверяет дневной лимит поисков для указанного сервера.
+    """
+    from src.config import get_server_limits
+    
+    try:
+        guild_id = int(server_id) if server_id.isdigit() else None
+    except ValueError:
+        guild_id = None
+        
+    limits = get_server_limits(guild_id)
+    max_searches = limits["max_searches_per_day"]
+    
+    if max_searches >= 999999:
+        return True
+        
+    today = datetime.now().strftime("%Y-%m-%d")
+    data = {}
+    
+    if os.path.exists(SEARCH_LIMITS_FILE):
+        try:
+            with open(SEARCH_LIMITS_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except Exception:
+            pass
+            
+    server_str = str(server_id)
+    if server_str not in data:
+        data[server_str] = {"date": today, "count": 0}
+        
+    server_data = data[server_str]
+    if server_data.get("date") != today:
+        server_data["date"] = today
+        server_data["count"] = 0
+        
+    if server_data["count"] >= max_searches:
+        return False
+        
+    server_data["count"] += 1
+    
+    try:
+        os.makedirs(os.path.dirname(SEARCH_LIMITS_FILE), exist_ok=True)
+        with open(SEARCH_LIMITS_FILE, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        print(f"[SEARCH_LIMITS] Ошибка записи счетчика: {e}", flush=True)
+        
+    return True
 
 
 def save_conversations(histories: dict) -> None:
@@ -391,3 +508,70 @@ def load_conversations() -> dict:
     except Exception as e:
         print(f"[LOAD_HIST] Ошибка загрузки истории из {CHAT_HISTORY_FILE}: {e}", flush=True)
         return {}
+    
+def get_max_active_channels(server_id: str) -> int:
+    """Возвращает максимальное количество активных каналов для сервера."""
+    data = load_memories_data()
+    return data.get("max_active_channels", {}).get(str(server_id), 2)
+
+
+def set_max_active_channels(server_id: str, limit: int) -> None:
+    """Сохраняет максимальное количество активных каналов для сервера."""
+    data = load_memories_data()
+    max_channels = data.setdefault("max_active_channels", {})
+    max_channels[str(server_id)] = limit
+    save_memories_data(data)
+
+
+def register_channel_server(channel_id: int, server_id: str) -> None:
+    """Регистрирует канал за конкретным сервером в memories.json."""
+    data = load_memories_data()
+    mapping = data.setdefault("channel_servers", {})
+    mapping[str(channel_id)] = str(server_id)
+    save_memories_data(data)
+
+
+def unregister_channel_server(channel_id: int) -> None:
+    """Удаляет канал из реестра memories.json."""
+    data = load_memories_data()
+    mapping = data.setdefault("channel_servers", {})
+    mapping.pop(str(channel_id), None)
+    save_memories_data(data)
+
+
+def get_active_channels_count(bot, server_id: str) -> int:
+    """
+    Подсчитывает количество активных каналов на указанном сервере.
+    Использует реестр в memories.json и кэш бота для обратной совместимости.
+    """
+    data = load_memories_data()
+    mapping = data.setdefault("channel_servers", {})
+    
+    # Получаем текущие активные ID каналов из оперативной памяти бота
+    active_ids = set(str(cid) for cid in bot.conversation_histories.keys())
+    
+    # Очищаем из реестра те каналы, которые больше не активны в памяти
+    outdated = [cid for cid in mapping if cid not in active_ids]
+    if outdated:
+        for cid in outdated:
+            mapping.pop(cid, None)
+        save_memories_data(data)
+    
+    count = 0
+    for cid_str in active_ids:
+        if cid_str in mapping:
+            if mapping[cid_str] == str(server_id):
+                count += 1
+        else:
+            # Если записи в реестре нет, пытаемся определить сервер через объект канала
+            try:
+                channel = bot.get_channel(int(cid_str))
+                if channel:
+                    ch_server_id = str(channel.guild.id) if getattr(channel, "guild", None) else f"DM_{cid_str}"
+                    mapping[cid_str] = ch_server_id
+                    save_memories_data(data)
+                    if ch_server_id == str(server_id):
+                        count += 1
+            except Exception:
+                pass
+    return count
