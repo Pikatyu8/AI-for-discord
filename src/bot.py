@@ -3,7 +3,7 @@ import asyncio
 import discord
 from discord.ext import commands
 
-from src.config import BASE_SYSTEM_INSTRUCTION, DISCORD_TOKEN
+from src.config import BASE_SYSTEM_INSTRUCTION, DISCORD_TOKEN, get_server_limits
 from src.llm import generate_content_with_retry, TOOLS
 from src.search import perform_search_async
 from src.utils import (
@@ -18,10 +18,16 @@ from src.utils import (
     extract_and_strip_thoughts,
     append_memory,
     read_memories,
+    get_custom_system_instruction,
+    check_and_increment_search,
     save_conversations,
     load_conversations,
     is_text_or_pdf_attachment,
-    extract_text_from_pdf
+    extract_text_from_pdf,
+    get_max_active_channels,
+    get_active_channels_count,
+    register_channel_server
+
 )
 from src.commands import setup as setup_commands
 
@@ -30,10 +36,9 @@ intents.message_content = True
 
 bot = commands.Bot(command_prefix="!", intents=intents)
 
-# Состояние истории диалогов и каналов (загружается из файла)
 bot.conversation_histories = load_conversations()
 bot.max_active_channels = 2
-bot.thinking_channels = set()  # Хранит ID каналов с включенным режимом размышлений
+bot.thinking_channels = set()
 
 
 @bot.event
@@ -41,7 +46,6 @@ async def on_ready():
     print(f"Discord-бот {bot.user.name} успешно запущен через API-прокси в сети!", flush=True)
 
 
-# Асинхронный хук инициализации бота для регистрации Cogs
 @bot.event
 async def setup_hook():
     await setup_commands(bot)
@@ -53,7 +57,39 @@ async def on_message(message):
     if message.author == bot.user:
         return
 
-    # Обязательно проверяем контекст перед выполнением, чтобы префиксные команды "!" уходили в Cog
+    # Гарантируем инициализацию bot_mentions в самом начале, чтобы избежать UnboundLocalError
+    bot_mentions = []
+    if bot.user:
+        if bot.user.name:
+            bot_mentions.append(f"@{bot.user.name}")
+        if bot.user.display_name:
+            bot_mentions.append(f"@{bot.user.display_name}")
+    if message.guild and message.guild.me:
+        if message.guild.me.display_name:
+            bot_mentions.append(f"@{message.guild.me.display_name}")
+        if message.guild.me.name:
+            bot_mentions.append(f"@{message.guild.me.name}")
+            
+    bot_mentions = sorted(list(set(m for m in bot_mentions if m and m != "@")), key=len, reverse=True)
+
+    # =================== [ДЕТАЛЬНЫЙ ДЕБАГ-ЛОГ] ===================
+    print(f"\n=================== [DEBUG ON_MESSAGE START] ===================", flush=True)
+    print(f"Сообщение от пользователя: {message.author} (ID: {message.author.id})", flush=True)
+    print(f"Канал ID: {message.channel.id} | Сервер ID: {message.guild.id if message.guild else 'DM'}", flush=True)
+    print(f"Интент Message Content в коде бота: {bot.intents.message_content}", flush=True)
+    print(f"Сырое содержание (message.content): '{message.content}'", flush=True)
+    print(f"Очищенное содержание (message.clean_content): '{message.clean_content}'", flush=True)
+    print(f"Количество вложений (attachments): {len(message.attachments)}", flush=True)
+    print(f"Сгенерированные упоминания для удаления: {bot_mentions}", flush=True)
+    
+    temp_clean = message.clean_content
+    for mention in bot_mentions:
+        temp_clean = temp_clean.replace(mention, "")
+    temp_clean = temp_clean.strip()
+    print(f"Результат фильтрации (clean_text): '{temp_clean}'", flush=True)
+    print(f"==================== [DEBUG ON_MESSAGE END] ====================\n", flush=True)
+    # =============================================================
+
     ctx = await bot.get_context(message)
     if ctx.valid:
         await bot.process_commands(message)
@@ -76,17 +112,23 @@ async def on_message(message):
         return
 
     if not is_active and (is_pinged or is_reply_to_bot):
-        if len(bot.conversation_histories) >= bot.max_active_channels:
+        server_id_str = str(message.guild.id) if message.guild else f"DM_{context_id}"
+        max_channels = get_max_active_channels(server_id_str)
+        active_count = get_active_channels_count(bot, server_id_str)
+
+        if active_count >= max_channels:
             await message.reply(
-                f"Достигнут лимит активных каналов ({bot.max_active_channels}). "
+                f"Достигнут лимит активных каналов на этом сервере ({max_channels}). "
                 "Попросите администратора изменить лимит через `!maxchannels` или отключите бота в другом канале командой `!stop`."
             )
             return
         
         bot.conversation_histories[context_id] = []
+        register_channel_server(context_id, server_id_str)  # Регистрируем канал за этим сервером
         is_active = True
         save_conversations(bot.conversation_histories)
-        print(f"[WAKEUP] Бот проснулся в канале {context_id}", flush=True)
+        print(f"[WAKEUP] Бот проснулся в канале {context_id} на сервере {server_id_str}", flush=True)
+
 
     if "http://" in message.content or "https://" in message.content:
         await asyncio.sleep(0.8)
@@ -95,18 +137,9 @@ async def on_message(message):
         except Exception:
             pass
 
-    # Используем clean_content для автозамены упоминаний <@id> на имена пользователей
     clean_text = message.clean_content
-    
-    # Фильтруем упоминание самого бота из текста
-    bot_mentions = [f"@{bot.user.name}", f"@{bot.user.display_name}"]
-    if message.guild and message.guild.me:
-        bot_mentions.append(f"@{message.guild.me.display_name}")
-        bot_mentions.append(f"@{message.guild.me.name}")
-        
-    for mention in sorted(list(set(bot_mentions)), key=len, reverse=True):
+    for mention in bot_mentions:
         clean_text = clean_text.replace(mention, "")
-        
     clean_text = clean_text.strip()
     
     embeds_text = extract_embeds_text(message)
@@ -164,18 +197,23 @@ async def on_message(message):
                 "image_url": {"url": base64_url}
             })
 
-    if clean_text:
-        parts.append({
-            "type": "text",
-            "text": f"{message.author.display_name}: {clean_text}"
-        })
+    server_id_str = str(message.guild.id) if message.guild else f"DM_{context_id}"
+    guild_id = message.guild.id if message.guild else None
+    limits = get_server_limits(guild_id)
 
-    if parts:
+    if parts or clean_text:
         history = bot.conversation_histories[context_id]
         
         if len(parts) == 1 and parts[0]["type"] == "text":
             content_to_add = parts[0]["text"]
+        elif not parts and clean_text:
+            content_to_add = f"{message.author.display_name}: {clean_text}"
         else:
+            if clean_text:
+                parts.append({
+                    "type": "text",
+                    "text": f"{message.author.display_name}: {clean_text}"
+                })
             content_to_add = parts
 
         if history and history[-1]["role"] == "user":
@@ -189,7 +227,7 @@ async def on_message(message):
         else:
             history.append({"role": "user", "content": content_to_add})
             
-        history = prune_history_local(history, max_tokens=128000)
+        history = prune_history_local(history, max_tokens=limits["max_context_tokens"])
         bot.conversation_histories[context_id] = history
         save_conversations(bot.conversation_histories)
 
@@ -202,8 +240,9 @@ async def on_message(message):
             
         history = bot.conversation_histories[context_id]
 
-        # Настраиваем системную инструкцию в зависимости от режима размышлений
-        sys_inst = BASE_SYSTEM_INSTRUCTION
+        custom_inst = get_custom_system_instruction(server_id_str)
+        sys_inst = custom_inst if custom_inst else BASE_SYSTEM_INSTRUCTION
+
         if context_id in bot.thinking_channels:
             sys_inst += (
                 "\n\nВАЖНО: Перед тем как написать финальный краткий ответ, ты ДОЛЖЕН подробно поразмышлять. "
@@ -219,15 +258,14 @@ async def on_message(message):
                 
                 while current_loop < max_agent_loops:
                     response = await generate_content_with_retry(history, sys_inst, tools=TOOLS)
-                    
                     tool_calls = getattr(response.choices[0].message, "tool_calls", None)
                     
                     if tool_calls:
                         current_loop += 1
                         message_obj = response.choices[0].message
                         content_raw = message_obj.content or ""
+                        print(f"[API_RESPONSE] Вызовы инструментов: {len(tool_calls)}", flush=True)
 
-                        # Вытаскиваем размышления, если они были сгенерированы перед вызовом инструмента
                         native_reasoning = None
                         if hasattr(message_obj, "reasoning") and message_obj.reasoning:
                             native_reasoning = message_obj.reasoning
@@ -270,21 +308,32 @@ async def on_message(message):
                                     
                                 print(f"[TOOL_CALL] Запрос поиска в сети: \"{search_query}\"", flush=True)
                                 
-                                status_msg = await message.reply(f"🔍 Ищу в сети: *{search_query}*...")
-                                search_results = await perform_search_async(search_query)
-                                
-                                try:
-                                    await status_msg.delete()
-                                except Exception:
-                                    pass
-                                
-                                tool_msg = {
-                                    "role": "tool",
-                                    "tool_call_id": tool_call.id,
-                                    "name": "web_search",
-                                    "content": json.dumps(search_results, ensure_ascii=False)
-                                }
-                                history.append(tool_msg)
+                                if not check_and_increment_search(server_id_str):
+                                    tool_err = "Ошибка: Превышен дневной лимит поисков в сети (5 поисков в день) для этого сервера."
+                                    print(f"[TOOL_CALL] Лимит поиска превышен для сервера {server_id_str}", flush=True)
+                                    tool_msg = {
+                                        "role": "tool",
+                                        "tool_call_id": tool_call.id,
+                                        "name": "web_search",
+                                        "content": json.dumps([{"title": "Превышен лимит", "url": "", "snippet": tool_err}], ensure_ascii=False)
+                                    }
+                                    history.append(tool_msg)
+                                else:
+                                    status_msg = await message.reply(f"🔍 Ищу в сети: *{search_query}*...")
+                                    search_results = await perform_search_async(search_query)
+                                    
+                                    try:
+                                        await status_msg.delete()
+                                    except Exception:
+                                        pass
+                                    
+                                    tool_msg = {
+                                        "role": "tool",
+                                        "tool_call_id": tool_call.id,
+                                        "name": "web_search",
+                                        "content": json.dumps(search_results, ensure_ascii=False)
+                                    }
+                                    history.append(tool_msg)
 
                             # 2. Сохранение заметок
                             elif tool_call.function.name == "save_note":
@@ -295,12 +344,19 @@ async def on_message(message):
                                 
                                 note_text = args.get("text", "")
                                 if note_text:
-                                    append_memory(f"({message.author.display_name} через ИИ): {note_text}")
-                                    tool_result = "Заметка успешно сохранена на диске."
+                                    saved = append_memory(
+                                        server_id_str, 
+                                        f"({message.author.display_name} через ИИ): {note_text}", 
+                                        is_manual=False
+                                    )
+                                    if saved:
+                                        tool_result = "Заметка успешно сохранена на диске."
+                                    else:
+                                        tool_result = f"Ошибка: Достигнут лимит автоматических заметок ({limits['max_tool_notes']}) на этом сервере."
                                 else:
                                     tool_result = "Ошибка: текст заметки оказался пустым."
 
-                                print(f"[TOOL_CALL] Сохранение заметки: \"{note_text}\"", flush=True)
+                                print(f"[TOOL_CALL] Сохранение заметки: \"{note_text}\" | Результат: {tool_result}", flush=True)
                                 tool_msg = {
                                     "role": "tool",
                                     "tool_call_id": tool_call.id,
@@ -311,8 +367,8 @@ async def on_message(message):
 
                             # 3. Чтение заметок
                             elif tool_call.function.name == "read_notes":
-                                print(f"[TOOL_CALL] Чтение сохраненных заметок из memories.txt", flush=True)
-                                notes_content = read_memories()
+                                print(f"[TOOL_CALL] Чтение сохраненных заметок для {server_id_str}", flush=True)
+                                notes_content = read_memories(server_id_str)
                                 tool_msg = {
                                     "role": "tool",
                                     "tool_call_id": tool_call.id,
@@ -321,21 +377,20 @@ async def on_message(message):
                                 }
                                 history.append(tool_msg)
                         
-                        bot.conversation_histories[context_id] = history
+                        bot.conversation_histories[context_id] = prune_history_local(history, max_tokens=limits["max_context_tokens"])
                         save_conversations(bot.conversation_histories)
                         continue
                     else:
                         message_obj = response.choices[0].message
                         content_raw = message_obj.content or ""
+                        print(f"[API_RESPONSE] Получен сырой текст ответа от модели: '{content_raw[:150]}...'", flush=True)
 
-                        # Проверяем нативные размышления
                         native_reasoning = None
                         if hasattr(message_obj, "reasoning") and message_obj.reasoning:
                             native_reasoning = message_obj.reasoning
                         elif getattr(message_obj, "model_extra", None) and "reasoning" in message_obj.model_extra:
                             native_reasoning = message_obj.model_extra["reasoning"]
 
-                        # Извлекаем размышления из разметки
                         reply_text, tagged_reasoning = extract_and_strip_thoughts(content_raw)
 
                         thoughts = native_reasoning or tagged_reasoning
@@ -343,10 +398,14 @@ async def on_message(message):
                             print(f"\n[THINKING LOG - Channel {context_id}]:\n{thoughts.strip()}\n[END THINKING LOG]\n", flush=True)
 
                         if not reply_text:
-                            reply_text = "Не удалось сформулировать ответ."
+                            has_tool_call = any(msg.get("role") == "tool" for msg in history)
+                            if has_tool_call:
+                                reply_text = "Готово! Запрос успешно выполнен."
+                            else:
+                                reply_text = "Не удалось сформулировать ответ."
 
                         history.append({"role": "assistant", "content": reply_text})
-                        bot.conversation_histories[context_id] = history
+                        bot.conversation_histories[context_id] = prune_history_local(history, max_tokens=limits["max_context_tokens"])
                         save_conversations(bot.conversation_histories)
                         break
                 
