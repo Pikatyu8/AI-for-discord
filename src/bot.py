@@ -2,6 +2,7 @@ import json
 import asyncio
 import discord
 from discord.ext import commands
+from datetime import datetime, timezone
 
 from src.config import BASE_SYSTEM_INSTRUCTION, DISCORD_TOKEN, get_server_limits
 from src.llm import generate_content_with_retry, TOOLS
@@ -26,8 +27,9 @@ from src.utils import (
     extract_text_from_pdf,
     get_max_active_channels,
     get_active_channels_count,
-    register_channel_server
-
+    register_channel_server,
+    format_message_timestamp,
+    format_message_with_metadata
 )
 from src.commands import setup as setup_commands
 
@@ -39,6 +41,20 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 bot.conversation_histories = load_conversations()
 bot.max_active_channels = 2
 bot.thinking_channels = set()
+
+
+async def get_message_reference(message):
+    """
+    Асинхронно получает сообщение, на которое был сделан ответ.
+    """
+    if not message.reference:
+        return None
+    try:
+        if message.reference.cached_message:
+            return message.reference.cached_message
+        return await message.channel.fetch_message(message.reference.message_id)
+    except Exception:
+        return None
 
 
 @bot.event
@@ -98,20 +114,14 @@ async def on_message(message):
     context_id = message.channel.id
     is_active = context_id in bot.conversation_histories
 
+    # Бот реагирует на прямое упоминание (ping) или на ЛС. 
+    # В соответствии с требованиями, на ответы без пинга бот не реагирует.
     is_pinged = (bot.user in message.mentions) or isinstance(message.channel, discord.DMChannel)
-    is_reply_to_bot = False
-    if message.reference:
-        try:
-            ref_msg = message.reference.cached_message or await message.channel.fetch_message(message.reference.message_id)
-            if ref_msg and ref_msg.author == bot.user:
-                is_reply_to_bot = True
-        except Exception:
-            pass
 
-    if not is_active and not (is_pinged or is_reply_to_bot):
+    if not is_active and not is_pinged:
         return
 
-    if not is_active and (is_pinged or is_reply_to_bot):
+    if not is_active and is_pinged:
         server_id_str = str(message.guild.id) if message.guild else f"DM_{context_id}"
         max_channels = get_max_active_channels(server_id_str)
         active_count = get_active_channels_count(bot, server_id_str)
@@ -201,19 +211,27 @@ async def on_message(message):
     guild_id = message.guild.id if message.guild else None
     limits = get_server_limits(guild_id)
 
+    # Получаем ссылку на сообщение (если есть) для красивой разметки в контексте
+    ref_msg = await get_message_reference(message)
+    full_message_text = format_message_with_metadata(
+        author_name=message.author.display_name,
+        clean_text=clean_text,
+        timestamp=message.created_at,
+        ref_msg=ref_msg
+    )
+
     if parts or clean_text:
         history = bot.conversation_histories[context_id]
         
         if len(parts) == 1 and parts[0]["type"] == "text":
-            content_to_add = parts[0]["text"]
+            content_to_add = f"{full_message_text}\n{parts[0]['text']}"
         elif not parts and clean_text:
-            content_to_add = f"{message.author.display_name}: {clean_text}"
+            content_to_add = full_message_text
         else:
-            if clean_text:
-                parts.append({
-                    "type": "text",
-                    "text": f"{message.author.display_name}: {clean_text}"
-                })
+            parts.append({
+                "type": "text",
+                "text": full_message_text
+            })
             content_to_add = parts
 
         if history and history[-1]["role"] == "user":
@@ -231,10 +249,11 @@ async def on_message(message):
         bot.conversation_histories[context_id] = history
         save_conversations(bot.conversation_histories)
 
-    if is_pinged or is_reply_to_bot:
+    if is_pinged:
         if not bot.conversation_histories[context_id]:
+            init_timestamp = format_message_timestamp(datetime.now(timezone.utc))
             bot.conversation_histories[context_id] = [
-                {"role": "user", "content": f"{message.author.display_name}: Привет"}
+                {"role": "user", "content": f"[{init_timestamp}] {message.author.display_name}: Привет"}
             ]
             save_conversations(bot.conversation_histories)
             
@@ -242,6 +261,13 @@ async def on_message(message):
 
         custom_inst = get_custom_system_instruction(server_id_str)
         sys_inst = custom_inst if custom_inst else BASE_SYSTEM_INSTRUCTION
+
+        # Добавляем жесткую инструкцию против повторения/генерации таймстампов
+        sys_inst += (
+            "\n\nПРИМЕЧАНИЕ: Все сообщения в истории снабжены метками времени в формате '[YYYY-MM-DD HH:MM:SS] Имя:'. "
+            "Это сделано исключительно для твоего контекста. Тебе самому писать таймстампы или свое имя в начале ответа КАТЕГОРИЧЕСКИ ЗАПРЕЩЕНО. "
+            "Отвечай сразу по существу, без метаданных в начале."
+        )
 
         if context_id in bot.thinking_channels:
             sys_inst += (
@@ -278,9 +304,10 @@ async def on_message(message):
                         if thoughts:
                             print(f"\n[THINKING LOG - Channel {context_id} (Перед инструментом)]:\n{thoughts.strip()}\n[END THINKING LOG]\n", flush=True)
 
+                        bot_timestamp_str = format_message_timestamp(datetime.now(timezone.utc))
                         assistant_msg = {
                             "role": "assistant",
-                            "content": clean_content,
+                            "content": f"[{bot_timestamp_str}] {clean_content}" if clean_content else "",
                             "tool_calls": [
                                 {
                                     "id": tc.id,
@@ -404,7 +431,8 @@ async def on_message(message):
                             else:
                                 reply_text = "Не удалось сформулировать ответ."
 
-                        history.append({"role": "assistant", "content": reply_text})
+                        bot_timestamp_str = format_message_timestamp(datetime.now(timezone.utc))
+                        history.append({"role": "assistant", "content": f"[{bot_timestamp_str}] {reply_text}"})
                         bot.conversation_histories[context_id] = prune_history_local(history, max_tokens=limits["max_context_tokens"])
                         save_conversations(bot.conversation_histories)
                         break
