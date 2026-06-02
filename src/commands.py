@@ -2,6 +2,7 @@ import json
 import io
 import discord
 from discord.ext import commands
+from datetime import datetime, timezone
 
 from src.config import BASE_SYSTEM_INSTRUCTION, get_server_limits
 from src.llm import generate_content_with_retry
@@ -29,7 +30,9 @@ from src.utils import (
     get_active_channels_count,
     register_channel_server,
     unregister_channel_server,
-    load_memories_data
+    load_memories_data,
+    format_message_timestamp,
+    format_message_with_metadata
 )
 
 class BotCommands(commands.Cog):
@@ -267,9 +270,14 @@ class BotCommands(commands.Cog):
         messages.reverse()
         new_history = []
         
+        # Строим мапу ID -> сообщение для быстрого поиска ответов (replies)
+        msg_map = {m.id: m for m in messages}
+        
         for msg in messages:
+            timestamp_str = format_message_timestamp(msg.created_at)
+            
             if msg.author == self.bot.user:
-                new_history.append({"role": "assistant", "content": msg.clean_content})
+                new_history.append({"role": "assistant", "content": f"[{timestamp_str}] {msg.clean_content}"})
             else:
                 clean_text = msg.clean_content
                 
@@ -329,27 +337,38 @@ class BotCommands(commands.Cog):
                             "image_url": {"url": base64_url}
                         })
                             
-                if clean_text:
+                # Определяем сообщение, на которое был дан ответ
+                ref_msg = None
+                if msg.reference:
+                    ref_msg = msg_map.get(msg.reference.message_id) or msg.reference.cached_message
+
+                full_message_text = format_message_with_metadata(
+                    author_name=msg.author.display_name,
+                    clean_text=clean_text,
+                    timestamp=msg.created_at,
+                    ref_msg=ref_msg
+                )
+                    
+                if len(parts) == 1 and parts[0]["type"] == "text":
+                    content_to_add = f"{full_message_text}\n{parts[0]['text']}"
+                elif not parts:
+                    content_to_add = full_message_text
+                else:
                     parts.append({
                         "type": "text",
-                        "text": f"{msg.author.display_name}: {clean_text}"
+                        "text": full_message_text
                     })
-                    
-                if parts:
-                    if len(parts) == 1 and parts[0]["type"] == "text":
-                        content_to_add = parts[0]["text"]
-                    else:
-                        content_to_add = parts
+                    content_to_add = parts
 
-                    if new_history and new_history[-1]["role"] == "user":
-                        existing_content = new_history[-1]["content"]
-                        if isinstance(existing_content, str):
-                            existing_content = [{"type": "text", "text": existing_content}]
-                        if isinstance(content_to_add, str):
-                            content_to_add = [{"type": "text", "text": content_to_add}]
-                        new_history[-1]["content"] = existing_content + content_to_add
-                    else:
-                        new_history.append({"role": "user", "content": content_to_add})
+                if new_history and new_history[-1]["role"] == "user":
+                    existing_content = new_history[-1]["content"]
+                    if isinstance(existing_content, str):
+                        existing_content = [{"type": "text", "text": existing_content}]
+                    if isinstance(content_to_add, str):
+                        content_to_add = [{"type": "text", "text": content_to_add}]
+                    new_history[-1]["content"] = existing_content + content_to_add
+                else:
+                    new_history.append({"role": "user", "content": content_to_add})
 
         new_history = prune_history_local(new_history, max_tokens=limits["max_context_tokens"])
         self.bot.conversation_histories[context_id] = new_history
@@ -396,6 +415,7 @@ class BotCommands(commands.Cog):
 
         history = self.bot.conversation_histories[context_id]
         
+        timestamp_str = format_message_timestamp(ctx.message.created_at)
         search_prompt = (
             f"Пользователь запросил принудительный поиск по теме: \"{query}\".\n"
             f"Вот результаты поиска из интернета:\n"
@@ -403,7 +423,7 @@ class BotCommands(commands.Cog):
             f"Пожалуйста, ответь на этот запрос пользователя, лаконично и емко опираясь на эти результаты."
         )
         
-        history.append({"role": "user", "content": search_prompt})
+        history.append({"role": "user", "content": f"[{timestamp_str}] Система: {search_prompt}"})
         history = prune_history_local(history, max_tokens=limits["max_context_tokens"])
         self.bot.conversation_histories[context_id] = history
         save_conversations(self.bot.conversation_histories)
@@ -411,6 +431,13 @@ class BotCommands(commands.Cog):
         # Выгружаем базовую или настроенную кастомную системную инструкцию
         custom_inst = get_custom_system_instruction(server_id_str)
         sys_inst = custom_inst if custom_inst else BASE_SYSTEM_INSTRUCTION
+
+        # Добавляем жесткую инструкцию против повторения/генерации таймстампов
+        sys_inst += (
+            "\n\nПРИМЕЧАНИЕ: Все сообщения в истории снабжены метками времени в формате '[YYYY-MM-DD HH:MM:SS] Имя:'. "
+            "Это сделано исключительно для твоего контекста. Тебе самому писать таймстампы или свое имя в начале ответа КАТЕГОРИЧЕСКИ ЗАПРЕЩЕНО. "
+            "Отвечай сразу по существу, без метаданных в начале."
+        )
 
         if context_id in self.bot.thinking_channels:
             sys_inst += (
@@ -440,7 +467,8 @@ class BotCommands(commands.Cog):
                 if not reply_text:
                     reply_text = "Не удалось сформулировать ответ по результатам поиска."
                 
-                history.append({"role": "assistant", "content": reply_text})
+                bot_timestamp_str = format_message_timestamp(datetime.now(timezone.utc))
+                history.append({"role": "assistant", "content": f"[{bot_timestamp_str}] {reply_text}"})
                 self.bot.conversation_histories[context_id] = prune_history_local(history, max_tokens=limits["max_context_tokens"])
                 save_conversations(self.bot.conversation_histories)
                 
