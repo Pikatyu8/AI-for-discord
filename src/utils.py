@@ -575,3 +575,38 @@ def get_active_channels_count(bot, server_id: str) -> int:
             except Exception:
                 pass
     return count
+
+
+def format_message_timestamp(dt) -> str:
+    """
+    Форматирует дату и время сообщения в Московском часовом поясе (UTC+3)
+    """
+    from datetime import timezone, timedelta
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    moscow_tz = timezone(timedelta(hours=3))
+    moscow_dt = dt.astimezone(moscow_tz)
+    return moscow_dt.strftime("%Y-%m-%d %H:%M:%S")
+
+
+def format_message_with_metadata(author_name: str, clean_text: str, timestamp, ref_msg=None) -> str:
+    """
+    Форматирует сообщение пользователя с добавлением даты, времени и информации об ответе.
+    """
+    timestamp_str = format_message_timestamp(timestamp)
+    reply_info = ""
+    if ref_msg:
+        ref_author = getattr(ref_msg.author, "display_name", str(ref_msg.author))
+        ref_content = getattr(ref_msg, "clean_content", "") or getattr(ref_msg, "content", "") or ""
+        
+        # Очищаем превью от лишних пробелов и переносов
+        ref_preview = ref_content.strip()
+        if len(ref_preview) > 80:
+            ref_preview = ref_preview[:80] + "..."
+        ref_preview = ref_preview.replace("\n", " ")
+        reply_info = f" (в ответ на {ref_author}: \"{ref_preview}\")"
+        
+    if clean_text:
+        return f"[{timestamp_str}] {author_name}{reply_info}: {clean_text}"
+    else:
+        return f"[{timestamp_str}] {author_name}{reply_info}"
