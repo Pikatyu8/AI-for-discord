@@ -6,7 +6,7 @@ from datetime import datetime, timezone
 
 from src.config import BASE_SYSTEM_INSTRUCTION, DISCORD_TOKEN, get_server_limits
 from src.llm import generate_content_with_retry, TOOLS
-from src.search import perform_search_async
+from src.search import perform_search_async, parse_queries_list
 from src.utils import (
     is_image_attachment,
     get_normalized_mime_type,
@@ -29,7 +29,8 @@ from src.utils import (
     get_active_channels_count,
     register_channel_server,
     format_message_timestamp,
-    format_message_with_metadata
+    format_message_with_metadata,
+    log_context_occupancy  # <-- ДОБАВЛЕН ИМПОРТ
 )
 from src.commands import setup as setup_commands
 
@@ -73,7 +74,22 @@ async def on_message(message):
     if message.author == bot.user:
         return
 
-    # Гарантируем инициализацию bot_mentions в самом начале, чтобы избежать UnboundLocalError
+    # === ДОБАВЛЕННЫЙ БЛОК: ПРОВЕРКА ПРАВ НА ОТПРАВКУ СООБЩЕНИЙ ===
+    if message.guild and message.guild.me:
+        permissions = message.channel.permissions_for(message.guild.me)
+        if not permissions.send_messages:
+            context_id = message.channel.id
+            # Если канал без прав записи почему-то был активен в памяти, принудительно очищаем его
+            if context_id in bot.conversation_histories:
+                bot.conversation_histories.pop(context_id, None)
+                unregister_channel_server(context_id)
+                save_conversations(bot.conversation_histories)
+                print(f"[PERMISSIONS] Канал {context_id} автоматически деактивирован: у бота нет прав на отправку сообщений.", flush=True)
+                log_context_occupancy(bot)
+            return  # Игнорируем любые действия в этом канале
+    # =============================================================
+
+
     bot_mentions = []
     if bot.user:
         if bot.user.name:
@@ -114,8 +130,6 @@ async def on_message(message):
     context_id = message.channel.id
     is_active = context_id in bot.conversation_histories
 
-    # Бот реагирует на прямое упоминание (ping) или на ЛС. 
-    # В соответствии с требованиями, на ответы без пинга бот не реагирует.
     is_pinged = (bot.user in message.mentions) or isinstance(message.channel, discord.DMChannel)
 
     if not is_active and not is_pinged:
@@ -129,15 +143,16 @@ async def on_message(message):
         if active_count >= max_channels:
             await message.reply(
                 f"Достигнут лимит активных каналов на этом сервере ({max_channels}). "
-                "Попросите администратора изменить лимит через `!maxchannels` или отключите бота в другом канале командой `!stop`."
+                "Попросите администратора изменить лимит через `!maxchannels` or отключите бота в другом канале командой `!stop`."
             )
             return
         
         bot.conversation_histories[context_id] = []
-        register_channel_server(context_id, server_id_str)  # Регистрируем канал за этим сервером
+        register_channel_server(context_id, server_id_str)
         is_active = True
         save_conversations(bot.conversation_histories)
         print(f"[WAKEUP] Бот проснулся в канале {context_id} на сервере {server_id_str}", flush=True)
+        log_context_occupancy(bot)  # <-- ВЫЗОВ ПРИ ПРОБУЖДЕНИИ
 
 
     if "http://" in message.content or "https://" in message.content:
@@ -211,7 +226,6 @@ async def on_message(message):
     guild_id = message.guild.id if message.guild else None
     limits = get_server_limits(guild_id)
 
-    # Получаем ссылку на сообщение (если есть) для красивой разметки в контексте
     ref_msg = await get_message_reference(message)
     full_message_text = format_message_with_metadata(
         author_name=message.author.display_name,
@@ -248,6 +262,7 @@ async def on_message(message):
         history = prune_history_local(history, max_tokens=limits["max_context_tokens"])
         bot.conversation_histories[context_id] = history
         save_conversations(bot.conversation_histories)
+        log_context_occupancy(bot)  # <-- ВЫЗОВ ПОСЛЕ ОБНОВЛЕНИЯ ИСТОРИИ СООБЩЕНИЕМ ПОЛЬЗОВАТЕЛЯ
 
     if is_pinged:
         if not bot.conversation_histories[context_id]:
@@ -262,12 +277,29 @@ async def on_message(message):
         custom_inst = get_custom_system_instruction(server_id_str)
         sys_inst = custom_inst if custom_inst else BASE_SYSTEM_INSTRUCTION
 
-        # Добавляем жесткую инструкцию против повторения/генерации таймстампов
         sys_inst += (
             "\n\nПРИМЕЧАНИЕ: Все сообщения в истории снабжены метками времени в формате '[YYYY-MM-DD HH:MM:SS] Имя:'. "
             "Это сделано исключительно для твоего контекста. Тебе самому писать таймстампы или свое имя в начале ответа КАТЕГОРИЧЕСКИ ЗАПРЕЩЕНО. "
             "Отвечай сразу по существу, без метаданных в начале."
         )
+
+        # ДОБАВЛЕННЫЙ БЛОК ИНСТРУКЦИЙ ДЛЯ ПОСЛЕДОВАТЕЛЬНОГО ПОИСКА:
+        sys_inst += (
+            "\n\nТЕБЕ ДОСТУПЕН ПОСЛЕДОВАТЕЛЬНЫЙ МНОГОШАГОВЫЙ ПОИСК (ДО 3 ШАГОВ): "
+            "Если после вызова `web_search` и получения результатов ты понимаешь, что информации для полного, "
+            "точного и достоверного ответа всё ещё не хватает, либо появились новые важные факты, требующие "
+            "уточнения, ты ДОЛЖЕН запустить инструмент `web_search` повторно с новыми скорректированными поисковыми запросами. "
+            "Ты можешь повторять поиск последовательно до 3 раз за один диалог. Не пытайся выдумывать факты, "
+            "если можешь найти их точное подтверждение в Google!"
+        )
+
+        if context_id in bot.thinking_channels:
+            sys_inst += (
+                "\n\nВАЖНО: Перед тем как написать финальный краткий ответ, ты ДОЛЖЕН подробно поразмышлять. "
+                "Свои подробные размышления обязательно запиши внутри тегов <think> и </think> в самом начале ответа. "
+                "Пример: <think>Тут твои размышления...</think>Твой финальный ответ."
+            )
+
 
         if context_id in bot.thinking_channels:
             sys_inst += (
@@ -322,21 +354,26 @@ async def on_message(message):
                         history.append(assistant_msg)
                         
                         for tool_call in tool_calls:
-                            # 1. Поиск в сети
                             if tool_call.function.name == "web_search":
                                 try:
                                     args = json.loads(tool_call.function.arguments)
                                 except Exception:
                                     args = {"query": tool_call.function.arguments}
                                     
-                                search_query = args.get("query", "")
-                                if not search_query:
-                                    search_query = tool_call.function.arguments
+                                if "queries" in args and isinstance(args["queries"], list):
+                                    search_input = args["queries"]
+                                elif "query" in args and args["query"]:
+                                    search_input = args["query"]
+                                else:
+                                    search_input = tool_call.function.arguments
                                     
-                                print(f"[TOOL_CALL] Запрос поиска в сети: \"{search_query}\"", flush=True)
+                                queries_to_run = parse_queries_list(search_input)[:5]
+                                queries_display = ", ".join(f"*{q}*" for q in queries_to_run)
+                                    
+                                print(f"[TOOL_CALL] Запрос поиска в сети (список): {queries_to_run}", flush=True)
                                 
                                 if not check_and_increment_search(server_id_str):
-                                    tool_err = "Ошибка: Превышен дневной лимит поисков в сети (5 поисков в день) для этого сервера."
+                                    tool_err = "Ошибка: Превышен дневной лимит поисков в сети для этого сервера."
                                     print(f"[TOOL_CALL] Лимит поиска превышен для сервера {server_id_str}", flush=True)
                                     tool_msg = {
                                         "role": "tool",
@@ -346,8 +383,10 @@ async def on_message(message):
                                     }
                                     history.append(tool_msg)
                                 else:
-                                    status_msg = await message.reply(f"🔍 Ищу в сети: *{search_query}*...")
-                                    search_results = await perform_search_async(search_query)
+                                    status_msg = await message.reply(f"🔍 Ищу в сети: {queries_display}...")
+                                    
+                                    # ИЗМЕНЕНО: Добавлен именованный аргумент force_google_only=True
+                                    search_results = await perform_search_async(queries_to_run, force_google_only=True)
                                     
                                     try:
                                         await status_msg.delete()
@@ -362,7 +401,7 @@ async def on_message(message):
                                     }
                                     history.append(tool_msg)
 
-                            # 2. Сохранение заметок
+
                             elif tool_call.function.name == "save_note":
                                 try:
                                     args = json.loads(tool_call.function.arguments)
@@ -392,7 +431,6 @@ async def on_message(message):
                                 }
                                 history.append(tool_msg)
 
-                            # 3. Чтение заметок
                             elif tool_call.function.name == "read_notes":
                                 print(f"[TOOL_CALL] Чтение сохраненных заметок для {server_id_str}", flush=True)
                                 notes_content = read_memories(server_id_str)
@@ -436,13 +474,45 @@ async def on_message(message):
                         bot.conversation_histories[context_id] = prune_history_local(history, max_tokens=limits["max_context_tokens"])
                         save_conversations(bot.conversation_histories)
                         break
-                
+                                # === ДОБАВЛЕННЫЙ БЛОК ДЛЯ ИСПРАВЛЕНИЯ ЛОГИКИ ЦИКЛА ===
+                # Если цикл завершился по лимиту шагов (current_loop == max_agent_loops),
+                # но последнее сообщение в истории — это ответ от инструмента,
+                # принудительно делаем финальный текстовый запрос к модели без инструментов.
+                if history and history[-1].get("role") == "tool":
+                    print(f"[AGENT] Достигнут лимит шагов ({max_agent_loops}). Запрашиваем финальный ответ...", flush=True)
+                    response = await generate_content_with_retry(history, sys_inst, tools=None)
+                    message_obj = response.choices[0].message
+                    content_raw = message_obj.content or ""
+                    
+                    native_reasoning = None
+                    if hasattr(message_obj, "reasoning") and message_obj.reasoning:
+                        native_reasoning = message_obj.reasoning
+                    elif getattr(message_obj, "model_extra", None) and "reasoning" in message_obj.model_extra:
+                        native_reasoning = message_obj.model_extra["reasoning"]
+
+                    reply_text, tagged_reasoning = extract_and_strip_thoughts(content_raw)
+
+                    thoughts = native_reasoning or tagged_reasoning
+                    if thoughts:
+                        print(f"\n[THINKING LOG - Channel {context_id} (Final)]: \n{thoughts.strip()}\n[END THINKING LOG]\n", flush=True)
+
+                    if not reply_text:
+                        reply_text = "Готово! Все запросы успешно выполнены."
+                    
+                    bot_timestamp_str = format_message_timestamp(datetime.now(timezone.utc))
+                    history.append({"role": "assistant", "content": f"[{bot_timestamp_str}] {reply_text}"})
+                    bot.conversation_histories[context_id] = prune_history_local(history, max_tokens=limits["max_context_tokens"])
+                    save_conversations(bot.conversation_histories)
+                # ===================================================
+
                 log_last_message(history, "ASSISTANT_REPLY")
+                log_context_occupancy(bot)
 
                 if len(reply_text) > 2000:
                     await message.reply(reply_text[:1900] + "\n\n*(Ответ обрезан из-за лимитов Discord)*")
                 else:
                     await message.reply(reply_text)
+
                     
             except Exception as e:
                 print(f"Ошибка API: {e}", flush=True)
