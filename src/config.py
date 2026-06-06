@@ -13,12 +13,15 @@ DISCORD_TOKEN = os.getenv("DISCORD_BOT_TOKEN")
 # Переменная для ИИ-поиска Tavily
 TAVILY_API_KEY = os.getenv("TAVILY_API_KEY")
 
+# Переменная для нативного ИИ-поиска Google Search
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+
 if not PROXY_KEY:
     print("КРИТИЧЕСКАЯ ОШИБКА: Переменная PROXY_API_KEY не задана!", flush=True)
     sys.exit(1)
 
 # ID целевого сервера с максимальными лимитами
-TARGET_SERVER_ID = 283467363729408000
+TARGET_SERVER_ID = 812033782294904863
 
 # Настройки для оригинального сервера (без жестких ограничений)
 ORIGINAL_LIMITS = {
@@ -31,9 +34,9 @@ ORIGINAL_LIMITS = {
 # Ограничения для остальных серверов
 DEFAULT_LIMITS = {
     "max_tool_notes": 10,               # Максимум 10 заметок без ручной команды
-    "max_searches_per_day": 5,          # 5 поисков в сети в день
-    "max_load_messages": 100,           # Загрузка максимум 100 сообщений
-    "max_context_tokens": 16000          # Контекстное окно 16к токенов
+    "max_searches_per_day": 15,          # 15 поисков в сети в день
+    "max_load_messages": 200,           # Загрузка максимум 200 сообщений
+    "max_context_tokens": 32000          # Контекстное окно 32к токенов
 }
 
 def get_server_limits(guild_id: int | None) -> dict:
