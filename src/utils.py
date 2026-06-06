@@ -610,3 +610,81 @@ def format_message_with_metadata(author_name: str, clean_text: str, timestamp, r
         return f"[{timestamp_str}] {author_name}{reply_info}: {clean_text}"
     else:
         return f"[{timestamp_str}] {author_name}{reply_info}"
+    
+    # === ДОБАВЛЕНО В КОНЕЦ ФАЙЛА src/utils.py ===
+
+def log_context_occupancy(bot) -> None:
+    """
+    Выводит в консоль структурированный отчет по заполненности контекста в токенах и процентах
+    для каждого активного канала, сгруппированных по серверам.
+    """
+    try:
+        from src.config import get_server_limits
+        
+        # Загружаем сохраненные соответствия каналов серверам из реестра
+        mem_data = load_memories_data()
+        channel_servers = mem_data.get("channel_servers", {})
+        
+        # Структура для группировки: {server_display_name: [channel_data]}
+        grouped = {}
+        
+        for channel_id, history in bot.conversation_histories.items():
+            channel = bot.get_channel(channel_id)
+            
+            guild_id = None
+            server_name = "Личные сообщения (DM)"
+            channel_name = f"ID: {channel_id}"
+            
+            if channel:
+                channel_name = getattr(channel, "name", channel_name)
+                if getattr(channel, "guild", None):
+                    guild_id = channel.guild.id
+                    server_name = f"Сервер '{channel.guild.name}' (ID: {guild_id})"
+            else:
+                # Если канала нет в кэше, пытаемся восстановить имя/ID сервера из сохраненного маппинга
+                saved_server_id = channel_servers.get(str(channel_id))
+                if saved_server_id:
+                    if saved_server_id.startswith("DM_"):
+                        server_name = "Личные сообщения (DM)"
+                    else:
+                        try:
+                            guild_id = int(saved_server_id)
+                            guild = bot.get_guild(guild_id)
+                            if guild:
+                                server_name = f"Сервер '{guild.name}' (ID: {guild_id})"
+                            else:
+                                server_name = f"Сервер ID: {saved_server_id}"
+                        except ValueError:
+                            server_name = f"Сервер ID: {saved_server_id}"
+                            
+            limits = get_server_limits(guild_id)
+            max_tokens = limits["max_context_tokens"]
+            current_tokens = estimate_tokens(history)
+            
+            percent = (current_tokens / max_tokens) * 100 if max_tokens > 0 else 0.0
+            
+            grouped.setdefault(server_name, []).append({
+                "name": channel_name,
+                "id": channel_id,
+                "current": current_tokens,
+                "max": max_tokens,
+                "percent": percent
+            })
+            
+        if not grouped:
+            print("\n[CONTEXT MONITOR] Нет активных контекстов диалогов.\n", flush=True)
+            return
+            
+        lines = ["\n" + "=" * 60, "[CONTEXT MONITOR] Текущая заполненность контекста по серверам и каналам:"]
+        for server, channels in grouped.items():
+            lines.append(f"• {server}:")
+            for ch in channels:
+                lines.append(
+                    f"  - #{ch['name']} (ID: {ch['id']}): "
+                    f"{ch['current']}/{ch['max']} токенов ({ch['percent']:.1f}%)"
+                )
+        lines.append("=" * 60 + "\n")
+        print("\n".join(lines), flush=True)
+        
+    except Exception as e:
+        print(f"[CONTEXT MONITOR ERROR] Ошибка при формировании отчета: {e}", flush=True)
