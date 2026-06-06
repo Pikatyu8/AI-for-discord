@@ -4,9 +4,15 @@ import discord
 from discord.ext import commands
 from datetime import datetime, timezone
 
-from src.config import BASE_SYSTEM_INSTRUCTION, get_server_limits
+from src.config import BASE_SYSTEM_INSTRUCTION, get_server_limits, GEMINI_API_KEY
 from src.llm import generate_content_with_retry
-from src.search import perform_search_async
+from src.search import (
+    perform_search_async, 
+    perform_google_search, 
+    HAS_GOOGLE_GENAI, 
+    GOOGLE_GENAI_IMPORT_ERROR,
+    parse_queries_list
+)
 from src.utils import (
     is_image_attachment,
     get_normalized_mime_type,
@@ -19,8 +25,8 @@ from src.utils import (
     extract_and_strip_thoughts,
     append_memory,
     read_memories,
-    get_custom_system_instruction,  # Получение системной инструкции
-    set_custom_system_instruction,  # Настройка системной инструкции
+    get_custom_system_instruction,
+    set_custom_system_instruction,
     check_and_increment_search,
     save_conversations,
     is_text_or_pdf_attachment,
@@ -32,7 +38,8 @@ from src.utils import (
     unregister_channel_server,
     load_memories_data,
     format_message_timestamp,
-    format_message_with_metadata
+    format_message_with_metadata,
+    log_context_occupancy  # <-- ДОБАВЛЕН ИМПОРТ
 )
 
 class BotCommands(commands.Cog):
@@ -43,15 +50,25 @@ class BotCommands(commands.Cog):
     async def stop_bot(self, ctx):
         context_id = ctx.channel.id
         self.bot.thinking_channels.discard(context_id)
-        if context_id in self.bot.conversation_histories:
+        
+        # Сначала гарантированно очищаем состояние в оперативной памяти и файлах
+        in_history = context_id in self.bot.conversation_histories
+        if in_history:
             self.bot.conversation_histories.pop(context_id, None)
             unregister_channel_server(context_id)
             save_conversations(self.bot.conversation_histories)
-            await ctx.send("Бот успешно остановлен и переведен в спящий режим в этом канале. Логгирование прекращено.")
             print(f"[STOP] Бот остановлен в канале {context_id}", flush=True)
             log_last_message([], "STOP")
-        else:
-            await ctx.send("Бот уже находится в спящем режиме в этом канале.")
+            log_context_occupancy(self.bot)
+        
+        # Пытаемся отправить подтверждение. Если прав нет (Forbidden), просто пишем в консоль
+        try:
+            if in_history:
+                await ctx.send("Бот успешно остановлен и переведен в спящий режим в этом канале. Логгирование прекращено.")
+            else:
+                await ctx.send("Бот уже находится в спящем режиме в этом канале.")
+        except discord.Forbidden:
+            print(f"[STOP] Предупреждение: Не удалось отправить подтверждение в канал {context_id} из-за отсутствия прав (Forbidden). Память успешно очищена локально.", flush=True)
 
     @commands.command(name="setsystem")
     async def set_system_instruction_cmd(self, ctx, *, text: str = None):
@@ -62,7 +79,6 @@ class BotCommands(commands.Cog):
 
         server_id_str = str(ctx.guild.id) if ctx.guild else f"DM_{ctx.channel.id}"
         
-        # Если аргументов нет, выводим текущую инструкцию
         if not text:
             current = get_custom_system_instruction(server_id_str)
             if current:
@@ -71,7 +87,6 @@ class BotCommands(commands.Cog):
                 await ctx.send("Кастомная системная инструкция не задана (используется дефолтная).")
             return
 
-        # Если передан аргумент "reset", возвращаем к дефолтной инструкции
         if text.lower() == "reset":
             set_custom_system_instruction(server_id_str, None)
             await ctx.send("Системная инструкция успешно сброшена на дефолтную!")
@@ -227,6 +242,7 @@ class BotCommands(commands.Cog):
             await ctx.send("Память бота для этого канала успешно очищена!")
             print(f"[UNLOAD] Очищен контекст для канала {context_id} ({ctx.channel.name})", flush=True)
             log_last_message([], "UNLOAD")
+            log_context_occupancy(self.bot)  # <-- ВЫЗОВ ПОСЛЕ ВЫГРУЗКИ КАНАЛА ИЗ ПАМЯТИ
         else:
             await ctx.send("Память бота для этого канала уже пуста.")
 
@@ -270,7 +286,6 @@ class BotCommands(commands.Cog):
         messages.reverse()
         new_history = []
         
-        # Строим мапу ID -> сообщение для быстрого поиска ответов (replies)
         msg_map = {m.id: m for m in messages}
         
         for msg in messages:
@@ -337,7 +352,6 @@ class BotCommands(commands.Cog):
                             "image_url": {"url": base64_url}
                         })
                             
-                # Определяем сообщение, на которое был дан ответ
                 ref_msg = None
                 if msg.reference:
                     ref_msg = msg_map.get(msg.reference.message_id) or msg.reference.cached_message
@@ -376,6 +390,7 @@ class BotCommands(commands.Cog):
         save_conversations(self.bot.conversation_histories)
         
         log_last_message(new_history, "LOAD_END")
+        log_context_occupancy(self.bot)  # <-- ВЫЗОВ ПОСЛЕ ЗАГРУЗКИ СТАРЫХ СООБЩЕНИЙ В ПАМЯТЬ
         await status_message.edit(content=f"Успешно загружено и обработано {len(messages)} сообщений в контекст!")
 
     @commands.command(name="search")
@@ -408,8 +423,11 @@ class BotCommands(commands.Cog):
             is_active = True
             save_conversations(self.bot.conversation_histories)
 
-        status_msg = await ctx.send(f"🔍 Выполняю принудительный поиск в сети по запросу: *{query}*...")
-        search_results = await perform_search_async(query)
+        queries_to_run = parse_queries_list(query)[:5]
+        queries_display = ", ".join(f"*{q}*" for q in queries_to_run)
+
+        status_msg = await ctx.send(f"🔍 Выполняю принудительный поиск в сети по запросам: {queries_display}...")
+        search_results = await perform_search_async(queries_to_run)
 
         await status_msg.edit(content=f"🔍 Найдено! Анализирую результаты для ответа...")
 
@@ -428,11 +446,9 @@ class BotCommands(commands.Cog):
         self.bot.conversation_histories[context_id] = history
         save_conversations(self.bot.conversation_histories)
 
-        # Выгружаем базовую или настроенную кастомную системную инструкцию
         custom_inst = get_custom_system_instruction(server_id_str)
         sys_inst = custom_inst if custom_inst else BASE_SYSTEM_INSTRUCTION
 
-        # Добавляем жесткую инструкцию против повторения/генерации таймстампов
         sys_inst += (
             "\n\nПРИМЕЧАНИЕ: Все сообщения в истории снабжены метками времени в формате '[YYYY-MM-DD HH:MM:SS] Имя:'. "
             "Это сделано исключительно для твоего контекста. Тебе самому писать таймстампы или свое имя в начале ответа КАТЕГОРИЧЕСКИ ЗАПРЕЩЕНО. "
@@ -465,7 +481,7 @@ class BotCommands(commands.Cog):
                     print(f"\n[THINKING LOG - Channel {context_id}]:\n{thoughts.strip()}\n[END THINKING LOG]\n", flush=True)
 
                 if not reply_text:
-                    reply_text = "Не удалось сформулировать ответ по результатам поиска."
+                    reply_text = "Не удалось сформулировать ответ."
                 
                 bot_timestamp_str = format_message_timestamp(datetime.now(timezone.utc))
                 history.append({"role": "assistant", "content": f"[{bot_timestamp_str}] {reply_text}"})
@@ -473,6 +489,7 @@ class BotCommands(commands.Cog):
                 save_conversations(self.bot.conversation_histories)
                 
                 log_last_message(history, "SEARCH_REPLY")
+                log_context_occupancy(self.bot)  # <-- ВЫЗОВ ПОСЛЕ ПОИСКА И ОТВЕТА БОТА
 
                 try:
                     await status_msg.delete()
@@ -487,6 +504,136 @@ class BotCommands(commands.Cog):
             except Exception as e:
                 print(f"Ошибка API при обработке поиска: {e}", flush=True)
                 await ctx.reply("Не удалось обработать запрос после поиска. Пожалуйста, попробуйте еще раз.")
+
+    @commands.command(name="search-google")
+    async def force_google_search(self, ctx, *, query: str = None):
+        """Принудительный поиск исключительно через Google Search (без Tavily)."""
+        if not query:
+            await ctx.send("Укажите, что именно нужно найти через Google. Пример: `!search-google релиз GTA 6`")
+            return
+
+        context_id = ctx.channel.id
+        guild_id = ctx.guild.id if ctx.guild else None
+        limits = get_server_limits(guild_id)
+        server_id_str = str(ctx.guild.id) if ctx.guild else f"DM_{context_id}"
+
+        google_available = True
+        reasons = []
+        
+        if not HAS_GOOGLE_GENAI:
+            google_available = False
+            reasons.append(f"библиотека 'google-genai' не импортируется (ошибка: {GOOGLE_GENAI_IMPORT_ERROR})")
+        
+        if not GEMINI_API_KEY:
+            google_available = False
+            reasons.append("переменная GEMINI_API_KEY отсутствует в .env")
+
+        if not google_available:
+            reasons_str = ", ".join(reasons)
+            await ctx.send(f"❌ **Google Search недоступен:** {reasons_str}.\nПоиск не запущен. Запросы Tavily не использовались.")
+            return
+
+        is_active = context_id in self.bot.conversation_histories
+        if not is_active:
+            max_channels = get_max_active_channels(server_id_str)
+            active_count = get_active_channels_count(self.bot, server_id_str)
+            if active_count >= max_channels:
+                await ctx.send(
+                    f"Не удалось активировать поиск. Достигнут лимит активных каналов на этом сервере ({max_channels}). "
+                    "Попросите администратора изменить лимит через `!maxchannels` или отключите бота в другом канале командой `!stop`."
+                )
+                return
+            self.bot.conversation_histories[context_id] = []
+            register_channel_server(context_id, server_id_str)
+            is_active = True
+            save_conversations(self.bot.conversation_histories)
+
+        queries_to_run = parse_queries_list(query)[:5]
+        queries_display = ", ".join(f"*{q}*" for q in queries_to_run)
+
+        status_msg = await ctx.send(f"🔍 Выполняю принудительный поиск в Google по запросам: {queries_display}...")
+        
+        search_results = await perform_search_async(queries_to_run, force_google_only=True)
+
+        if not search_results or (len(search_results) == 1 and search_results[0].get("title") == "Результаты отсутствуют"):
+            await status_msg.edit(content=f"⚠️ Google Search не вернул результатов для запросов: {queries_display}. Запросы Tavily не использовались.")
+            return
+
+        await status_msg.edit(content=f"🔍 Найдено {len(search_results)} результатов в Google! Анализирую для ответа...")
+
+        history = self.bot.conversation_histories[context_id]
+        
+        timestamp_str = format_message_timestamp(ctx.message.created_at)
+        search_prompt = (
+            f"Пользователь запросил принудительный поиск в Google по теме: \"{query}\".\n"
+            f"Вот результаты поиска:\n"
+            f"{json.dumps(search_results, ensure_ascii=False, indent=2)}\n\n"
+            f"Пожалуйста, ответь на этот запрос пользователя, лаконично и емко опираясь на эти результаты."
+        )
+        
+        history.append({"role": "user", "content": f"[{timestamp_str}] Система: {search_prompt}"})
+        history = prune_history_local(history, max_tokens=limits["max_context_tokens"])
+        self.bot.conversation_histories[context_id] = history
+        save_conversations(self.bot.conversation_histories)
+
+        custom_inst = get_custom_system_instruction(server_id_str)
+        sys_inst = custom_inst if custom_inst else BASE_SYSTEM_INSTRUCTION
+
+        sys_inst += (
+            "\n\nПРИМЕЧАНИЕ: Все сообщения в истории снабжены метками времени в формате '[YYYY-MM-DD HH:MM:SS] Имя:'. "
+            "Это сделано исключительно для твоего контекста. Тебе самому писать таймстампы или свое имя в начале ответа КАТЕГОРИЧЕСКИ ЗАПРЕЩЕНО. "
+            "Отвечай сразу по существу, без метаданных в начале."
+        )
+
+        if context_id in self.bot.thinking_channels:
+            sys_inst += (
+                "\n\nВАЖНО: Перед тем как написать финальный краткий ответ, ты ДОЛЖЕН подробно поразмышлять. "
+                "Свои подробные размышления обязательно запиши внутри тегов <think> и </think> в самом начале ответа. "
+                "Пример: <think>Тут твои размышления...</think>Твой финальный ответ."
+            )
+
+        async with ctx.channel.typing():
+            try:
+                response = await generate_content_with_retry(history, sys_inst)
+                message_obj = response.choices[0].message
+                raw_content = message_obj.content or ""
+                
+                native_reasoning = None
+                if hasattr(message_obj, "reasoning") and message_obj.reasoning:
+                    native_reasoning = message_obj.reasoning
+                elif getattr(message_obj, "model_extra", None) and "reasoning" in message_obj.model_extra:
+                    native_reasoning = message_obj.model_extra["reasoning"]
+
+                reply_text, tagged_reasoning = extract_and_strip_thoughts(raw_content)
+
+                thoughts = native_reasoning or tagged_reasoning
+                if thoughts:
+                    print(f"\n[THINKING LOG - Channel {context_id}]:\n{thoughts.strip()}\n[END THINKING LOG]\n", flush=True)
+
+                if not reply_text:
+                    reply_text = "Не удалось сформулировать ответ по результатам поиска Google."
+                
+                bot_timestamp_str = format_message_timestamp(datetime.now(timezone.utc))
+                history.append({"role": "assistant", "content": f"[{bot_timestamp_str}] {reply_text}"})
+                self.bot.conversation_histories[context_id] = prune_history_local(history, max_tokens=limits["max_context_tokens"])
+                save_conversations(self.bot.conversation_histories)
+                
+                log_last_message(history, "GOOGLE_SEARCH_REPLY")
+                log_context_occupancy(self.bot)  # <-- ВЫЗОВ ПОСЛЕ ПОИСКА GOOGLE И ОТВЕТА БОТА
+
+                try:
+                    await status_msg.delete()
+                except Exception:
+                    pass
+
+                if len(reply_text) > 2000:
+                    await ctx.reply(reply_text[:1900] + "\n\n*(Ответ обрезан из-за лимитов Discord)*")
+                else:
+                    await ctx.reply(reply_text)
+                    
+            except Exception as e:
+                print(f"Ошибка API при обработке поиска Google: {e}", flush=True)
+                await ctx.reply("Не удалось обработать запрос после поиска Google. Пожалуйста, попробуйте еще раз.")
 
     @commands.command(name="note")
     async def add_note_cmd(self, ctx, *, text: str = None):
