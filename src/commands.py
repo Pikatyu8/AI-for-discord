@@ -1,6 +1,7 @@
 import json
 import io
 import discord
+import re
 from discord.ext import commands
 from datetime import datetime, timezone
 
@@ -475,6 +476,7 @@ class BotCommands(commands.Cog):
                     native_reasoning = message_obj.model_extra["reasoning"]
 
                 reply_text, tagged_reasoning = extract_and_strip_thoughts(raw_content)
+                reply_text = re.sub(r'^(\s*\[\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2}\]\s*)+', '', reply_text).strip()
 
                 thoughts = native_reasoning or tagged_reasoning
                 if thoughts:
