@@ -1,12 +1,14 @@
+# commands.py
 import json
 import io
 import discord
 import re
+import asyncio
 from discord.ext import commands
 from datetime import datetime, timezone
 
 from src.config import BASE_SYSTEM_INSTRUCTION, get_server_limits, GEMINI_API_KEY
-from src.llm import generate_content_with_retry
+from src.llm import generate_content_with_retry, describe_image_async
 from src.search import (
     perform_search_async, 
     perform_google_search, 
@@ -40,19 +42,198 @@ from src.utils import (
     load_memories_data,
     format_message_timestamp,
     format_message_with_metadata,
-    log_context_occupancy  # <-- ДОБАВЛЕН ИМПОРТ
+    log_context_occupancy
 )
+
+def find_cache_entry_by_target(target: str) -> str | None:
+    """
+    Ищет ключ в IMAGE_DESCRIPTION_CACHE по MD5-хэшу (полному или первыми 8 символами),
+    ID сообщения или по полной ссылке на сообщение.
+    """
+    from src.llm import IMAGE_DESCRIPTION_CACHE
+    target = target.strip()
+    
+    if not target:
+        return None
+        
+    # 1. Полнотекстовое совпадение с MD5
+    if target in IMAGE_DESCRIPTION_CACHE:
+        return target
+        
+    # 2. Совпадение хэша без учета регистра
+    if len(target) == 32 and all(c in "0123456789abcdefABCDEF" for c in target):
+        target_lower = target.lower()
+        if target_lower in IMAGE_DESCRIPTION_CACHE:
+            return target_lower
+            
+    # 3. Поиск по ссылке на сообщение (например, https://discord.com/channels/123/456/789)
+    msg_link_match = re.search(r'channels/(?:@me|\d+)/\d+/(\d+)', target)
+    if msg_link_match:
+        msg_id = msg_link_match.group(1)
+        for h, val in IMAGE_DESCRIPTION_CACHE.items():
+            if isinstance(val, dict) and str(val.get("message_id")) == msg_id:
+                return h
+                
+    # 4. Поиск по чистому ID сообщения
+    if target.isdigit():
+        for h, val in IMAGE_DESCRIPTION_CACHE.items():
+            if isinstance(val, dict) and str(val.get("message_id")) == target:
+                return h
+                
+    # 5. Поиск по частичному совпадению хэша (префиксу, например первые 8 символов)
+    for h in IMAGE_DESCRIPTION_CACHE.keys():
+        if h.startswith(target.lower()):
+            return h
+            
+    return None
+
+
 
 class BotCommands(commands.Cog):
     def __init__(self, bot):
         self.bot = bot
+
+
+    @commands.command(name="show-descs")
+    async def show_descs_cmd(self, ctx):
+        """Показывает описания картинок с ссылками на сообщения."""
+        from src.llm import IMAGE_DESCRIPTION_CACHE
+        
+        if not IMAGE_DESCRIPTION_CACHE:
+            await ctx.send("Описаний картинок пока нет в кэше.")
+            return
+            
+        lines = ["**Сохраненные описания картинок:**"]
+        for img_hash, entry in IMAGE_DESCRIPTION_CACHE.items():
+            if isinstance(entry, dict):
+                desc = entry.get("description", "")
+                m_id = entry.get("message_id")
+                c_id = entry.get("channel_id")
+                g_id = entry.get("guild_id")
+                
+                if m_id and c_id:
+                    g_str = str(g_id) if g_id else "@me"
+                    link = f"https://discord.com/channels/{g_str}/{c_id}/{m_id}"
+                    link_text = f"[Ссылка]({link})"
+                else:
+                    link_text = "Ссылка отсутствует"
+                    
+                short_desc = desc if len(desc) <= 120 else desc[:117] + "..."
+                lines.append(f"• `{img_hash[:8]}` ({link_text}): {short_desc}")
+            else:
+                short_desc = entry if len(entry) <= 120 else entry[:117] + "..."
+                lines.append(f"• `{img_hash[:8]}` (Нет ссылки): {short_desc}")
+                
+        full_text = "\n".join(lines)
+        if len(full_text) > 1900:
+            file_data = io.BytesIO(full_text.encode("utf-8"))
+            discord_file = discord.File(fp=file_data, filename="image_descriptions.txt")
+            await ctx.send("Кэш описаний слишком большой. Полный список выгружен в файл:", file=discord_file)
+        else:
+            await ctx.send(full_text)
+
+    @commands.command(name="edit-desc")
+    async def edit_desc_cmd(self, ctx, *, args: str = None):
+        """Редактирует описание картинки по хешу/ссылке на сообщение, если текущее описание неточно."""
+        from src.llm import IMAGE_DESCRIPTION_CACHE
+        
+        if not args:
+            await ctx.send(
+                "Укажите параметры. Формат команды:\n"
+                "`!edit-desc <хэш или ссылка> | <новое описание>`\n\n"
+                "Примеры:\n"
+                "• `!edit-desc 8a9b2c3d | Кошка сидит на диване`\n"
+                "• `!edit-desc https://discord.com/channels/123/456/789 | Исправленный текст`"
+            )
+            return
+            
+        parts = [p.strip() for p in args.split("|") if p.strip()]
+        if len(parts) < 2:
+            # Если разделитель "|" отсутствует, пробуем разделить по первому пробелу
+            split_space = args.split(maxsplit=1)
+            if len(split_space) == 2:
+                target_cand, desc_cand = split_space
+                if len(target_cand) == 32 or "channels/" in target_cand or target_cand.isdigit():
+                    parts = [target_cand, desc_cand]
+                    
+        if len(parts) < 2:
+            await ctx.send("Ошибка: Не удалось распознать аргументы. Используйте вертикальную черту `|` для разделения хэша/ссылки и нового описания.")
+            return
+            
+        target, new_desc = parts[0], parts[1]
+        img_hash = find_cache_entry_by_target(target)
+        
+        if not img_hash or img_hash not in IMAGE_DESCRIPTION_CACHE:
+            await ctx.send(f"Ошибка: Не найдено сохраненное описание для '{target}' в кэше.")
+            return
+            
+        entry = IMAGE_DESCRIPTION_CACHE[img_hash]
+        if isinstance(entry, dict):
+            entry["description"] = new_desc
+        else:
+            # Преобразуем старую плоскую запись в новую структуру
+            IMAGE_DESCRIPTION_CACHE[img_hash] = {
+                "description": new_desc,
+                "message_id": None,
+                "channel_id": None,
+                "guild_id": None
+            }
+            
+        await ctx.send(f"Описание для картинки `{img_hash[:8]}` успешно отредактировано!")
+
+    @commands.command(name="help")
+    async def help_cmd(self, ctx, *, lang: str = "ru"):
+        """Показывает список доступных команд."""
+        lang = lang.replace("|", "").strip().lower()
+        if lang not in ["en", "english"]:
+            help_text = (
+                "**Доступные команды бота:**\n"
+                "```\n"
+                "!load n - загружает n сообщений в чате, до 201\n"
+                "!unload - выгружает все сообщения из чата\n"
+                "!export | json - показывает историю чата в боте (можно запустить с параметром json)\n"
+                "!show - показывает, где активен бот\n"
+                "!stop - приостанавливает запись сообщений в канале\n"
+                "!maxchannels | n - задает максимум активных каналов для бота (по умолчанию 2)\n"
+                "!think | on/off - переключает режим размышлений модели\n"
+                "!search | info  - ищет информацию и заставляет бота ответить на её основе\n"
+                "!search-google | info - тоже самое что и !search но без фолбека на тавили\n"
+                "!note | text - создает запись в память бота для текущего сервера\n"
+                "!notes - показывает записи в памяти\n"
+                "!show-descs - показывает описания картинок с ссылками на сообщения\n"
+                "!edit-desc | md5-hash/message link | desc - редактирует описание картинки по хешу/ссылке на сообщение, если текущее описание неточно\n"
+                "!help | en/ru - показывает этот текст\n"
+                "```"
+            )
+        else:
+            help_text = (
+                "**Available bot commands:**\n"
+                "```\n"
+                "!load n - loads n messages from the chat, up to 201\n"
+                "!unload - unloads all messages from the chat\n"
+                "!export | json - displays the chat history in the bot (can be run with the json parameter)\n"
+                "!show - shows where the bot is active\n"
+                "!stop - pauses message logging in the channel\n"
+                "!maxchannels | n - sets the maximum number of active channels for the bot (default is 2)\n"
+                "!think | on/off - toggles the model's thinking mode\n"
+                "!search | info  - searches for information and prompts the bot to respond based on it\n"
+                "!search-google | info - same as !search but without a fallback to the bot\n"
+                "!note | text - creates an entry in the bot's memory for the current server\n"
+                "!notes - displays entries in memory\n"
+                "!show-descs - displays image descriptions with links to messages\n"
+                "!edit-desc | md5-hash/message link | desc - edits the image description based on the hash/message link if the current description is inaccurate\n"
+                "!help | en/ru - displays this text\n"
+                "```"
+            )
+        await ctx.send(help_text)
+
+    
 
     @commands.command(name="stop")
     async def stop_bot(self, ctx):
         context_id = ctx.channel.id
         self.bot.thinking_channels.discard(context_id)
         
-        # Сначала гарантированно очищаем состояние в оперативной памяти и файлах
         in_history = context_id in self.bot.conversation_histories
         if in_history:
             self.bot.conversation_histories.pop(context_id, None)
@@ -62,7 +243,6 @@ class BotCommands(commands.Cog):
             log_last_message([], "STOP")
             log_context_occupancy(self.bot)
         
-        # Пытаемся отправить подтверждение. Если прав нет (Forbidden), просто пишем в консоль
         try:
             if in_history:
                 await ctx.send("Бот успешно остановлен и переведен в спящий режим в этом канале. Логгирование прекращено.")
@@ -243,7 +423,7 @@ class BotCommands(commands.Cog):
             await ctx.send("Память бота для этого канала успешно очищена!")
             print(f"[UNLOAD] Очищен контекст для канала {context_id} ({ctx.channel.name})", flush=True)
             log_last_message([], "UNLOAD")
-            log_context_occupancy(self.bot)  # <-- ВЫЗОВ ПОСЛЕ ВЫГРУЗКИ КАНАЛА ИЗ ПАМЯТИ
+            log_context_occupancy(self.bot)
         else:
             await ctx.send("Память бота для этого канала уже пуста.")
 
@@ -278,7 +458,8 @@ class BotCommands(commands.Cog):
         
         messages = []
         async for msg in ctx.channel.history(limit=limit + 10):
-            if msg.id == ctx.message.id:
+            # Пропускаем и само сообщение команды, и временное сервисное сообщение бота
+            if msg.id == ctx.message.id or msg.id == status_message.id:
                 continue
             messages.append(msg)
             if len(messages) == limit:
@@ -324,7 +505,11 @@ class BotCommands(commands.Cog):
                             base64_url = bytes_to_base64_url(img_bytes, mime_type)
                             parts.append({
                                 "type": "image_url",
-                                "image_url": {"url": base64_url}
+                                "image_url": {
+                                    "url": base64_url,
+                                    "message_id": msg.id,
+                                    "channel_id": msg.channel.id
+                                }
                             })
                         except Exception as e:
                             print(f"[LOAD] Ошибка загрузки картинки из вложений: {e}", flush=True)
@@ -350,7 +535,11 @@ class BotCommands(commands.Cog):
                     if base64_url:
                         parts.append({
                             "type": "image_url",
-                            "image_url": {"url": base64_url}
+                            "image_url": {
+                                "url": base64_url,
+                                "message_id": msg.id,
+                                "channel_id": msg.channel.id
+                            }
                         })
                             
                 ref_msg = None
@@ -390,8 +579,31 @@ class BotCommands(commands.Cog):
         register_channel_server(context_id, server_id_str)
         save_conversations(self.bot.conversation_histories)
         
+        # === АВТОМАТИЧЕСКИЙ ЗАПУСК ОПИСАНИЙ ПОСЛЕ !load ===
+        image_tasks_count = 0
+        for msg_item in new_history:
+            content_item = msg_item.get("content")
+            if isinstance(content_item, list):
+                for part in content_item:
+                    if part.get("type") == "image_url":
+                        url_obj = part.get("image_url", {})
+                        url = url_obj.get("url", "")
+                        m_id = url_obj.get("message_id")
+                        c_id = url_obj.get("channel_id")
+                        if url:
+                            # Запуск асинхронной задачи генерации без блокирования ответа в Discord
+                            asyncio.create_task(describe_image_async(
+                                url, 
+                                message_id=m_id, 
+                                channel_id=c_id, 
+                                bot=self.bot
+                            ))
+                            image_tasks_count += 1
+        if image_tasks_count > 0:
+            print(f"[LOAD] Автоматически запущено фоновое описание для {image_tasks_count} изображений из истории.", flush=True)
+        
         log_last_message(new_history, "LOAD_END")
-        log_context_occupancy(self.bot)  # <-- ВЫЗОВ ПОСЛЕ ЗАГРУЗКИ СТАРЫХ СООБЩЕНИЙ В ПАМЯТЬ
+        log_context_occupancy(self.bot)
         await status_message.edit(content=f"Успешно загружено и обработано {len(messages)} сообщений в контекст!")
 
     @commands.command(name="search")
@@ -465,7 +677,13 @@ class BotCommands(commands.Cog):
 
         async with ctx.channel.typing():
             try:
-                response = await generate_content_with_retry(history, sys_inst)
+                # Передаем статус режима !think в API с привязкой бота
+                response = await generate_content_with_retry(
+                    history, 
+                    sys_inst, 
+                    thinking_enabled=(context_id in self.bot.thinking_channels),
+                    bot=self.bot
+                )
                 message_obj = response.choices[0].message
                 raw_content = message_obj.content or ""
                 
@@ -478,7 +696,7 @@ class BotCommands(commands.Cog):
                 reply_text, tagged_reasoning = extract_and_strip_thoughts(raw_content)
                 reply_text = re.sub(r'^(\s*\[\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2}\]\s*)+', '', reply_text).strip()
 
-                thoughts = native_reasoning or tagged_reasoning
+                thoughts = tagged_reasoning or native_reasoning
                 if thoughts:
                     print(f"\n[THINKING LOG - Channel {context_id}]:\n{thoughts.strip()}\n[END THINKING LOG]\n", flush=True)
 
@@ -491,7 +709,7 @@ class BotCommands(commands.Cog):
                 save_conversations(self.bot.conversation_histories)
                 
                 log_last_message(history, "SEARCH_REPLY")
-                log_context_occupancy(self.bot)  # <-- ВЫЗОВ ПОСЛЕ ПОИСКА И ОТВЕТА БОТА
+                log_context_occupancy(self.bot)
 
                 try:
                     await status_msg.delete()
@@ -596,7 +814,13 @@ class BotCommands(commands.Cog):
 
         async with ctx.channel.typing():
             try:
-                response = await generate_content_with_retry(history, sys_inst)
+                # Передаем статус режима !think в API с привязкой бота
+                response = await generate_content_with_retry(
+                    history, 
+                    sys_inst, 
+                    thinking_enabled=(context_id in self.bot.thinking_channels),
+                    bot=self.bot
+                )
                 message_obj = response.choices[0].message
                 raw_content = message_obj.content or ""
                 
@@ -608,7 +832,7 @@ class BotCommands(commands.Cog):
 
                 reply_text, tagged_reasoning = extract_and_strip_thoughts(raw_content)
 
-                thoughts = native_reasoning or tagged_reasoning
+                thoughts = tagged_reasoning or native_reasoning
                 if thoughts:
                     print(f"\n[THINKING LOG - Channel {context_id}]:\n{thoughts.strip()}\n[END THINKING LOG]\n", flush=True)
 
@@ -621,7 +845,7 @@ class BotCommands(commands.Cog):
                 save_conversations(self.bot.conversation_histories)
                 
                 log_last_message(history, "GOOGLE_SEARCH_REPLY")
-                log_context_occupancy(self.bot)  # <-- ВЫЗОВ ПОСЛЕ ПОИСКА GOOGLE И ОТВЕТА БОТА
+                log_context_occupancy(self.bot)
 
                 try:
                     await status_msg.delete()
