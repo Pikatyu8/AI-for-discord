@@ -1,3 +1,4 @@
+# bot.py
 import json
 import asyncio
 import re
@@ -5,6 +6,7 @@ import discord
 from discord.ext import commands
 from datetime import datetime, timezone
 
+from src.llm import generate_content_with_retry, TOOLS, describe_image_async
 from src.config import BASE_SYSTEM_INSTRUCTION, DISCORD_TOKEN, get_server_limits
 from src.llm import generate_content_with_retry, TOOLS
 from src.search import perform_search_async, parse_queries_list
@@ -31,14 +33,14 @@ from src.utils import (
     register_channel_server,
     format_message_timestamp,
     format_message_with_metadata,
-    log_context_occupancy  # <-- ДОБАВЛЕН ИМПОРТ
+    log_context_occupancy
 )
 from src.commands import setup as setup_commands
 
 intents = discord.Intents.default()
 intents.message_content = True
 
-bot = commands.Bot(command_prefix="!", intents=intents)
+bot = commands.Bot(command_prefix="!", intents=intents, help_command=None) # Отключена встроенная справка
 
 bot.conversation_histories = load_conversations()
 bot.max_active_channels = 2
@@ -75,20 +77,18 @@ async def on_message(message):
     if message.author == bot.user:
         return
 
-    # === ДОБАВЛЕННЫЙ БЛОК: ПРОВЕРКА ПРАВ НА ОТПРАВКУ СООБЩЕНИЙ ===
+    # === ПРОВЕРКА ПРАВ НА ОТПРАВКУ СООБЩЕНИЙ ===
     if message.guild and message.guild.me:
         permissions = message.channel.permissions_for(message.guild.me)
         if not permissions.send_messages:
             context_id = message.channel.id
-            # Если канал без прав записи почему-то был активен в памяти, принудительно очищаем его
             if context_id in bot.conversation_histories:
                 bot.conversation_histories.pop(context_id, None)
                 unregister_channel_server(context_id)
                 save_conversations(bot.conversation_histories)
                 print(f"[PERMISSIONS] Канал {context_id} автоматически деактивирован: у бота нет прав на отправку сообщений.", flush=True)
                 log_context_occupancy(bot)
-            return  # Игнорируем любые действия в этом канале
-    # =============================================================
+            return
 
 
     bot_mentions = []
@@ -144,7 +144,7 @@ async def on_message(message):
         if active_count >= max_channels:
             await message.reply(
                 f"Достигнут лимит активных каналов на этом сервере ({max_channels}). "
-                "Попросите администратора изменить лимит через `!maxchannels` or отключите бота в другом канале командой `!stop`."
+                "Попросите администратора изменить лимит через `!maxchannels` или отключите бота в другом канале командой `!stop`."
             )
             return
         
@@ -153,7 +153,7 @@ async def on_message(message):
         is_active = True
         save_conversations(bot.conversation_histories)
         print(f"[WAKEUP] Бот проснулся в канале {context_id} на сервере {server_id_str}", flush=True)
-        log_context_occupancy(bot)  # <-- ВЫЗОВ ПРИ ПРОБУЖДЕНИИ
+        log_context_occupancy(bot)
 
 
     if "http://" in message.content or "https://" in message.content:
@@ -189,7 +189,11 @@ async def on_message(message):
                 
                 parts.append({
                     "type": "image_url",
-                    "image_url": {"url": base64_url}
+                    "image_url": {
+                        "url": base64_url,
+                        "message_id": message.id,
+                        "channel_id": message.channel.id
+                    }
                 })
             except Exception as e:
                 print(f"[Вложение] Ошибка при чтении файла {attachment.filename}: {e}", flush=True)
@@ -220,7 +224,11 @@ async def on_message(message):
         if base64_url:
             parts.append({
                 "type": "image_url",
-                "image_url": {"url": base64_url}
+                "image_url": {
+                    "url": base64_url,
+                    "message_id": message.id,
+                    "channel_id": message.channel.id
+                }
             })
 
     server_id_str = str(message.guild.id) if message.guild else f"DM_{context_id}"
@@ -263,7 +271,22 @@ async def on_message(message):
         history = prune_history_local(history, max_tokens=limits["max_context_tokens"])
         bot.conversation_histories[context_id] = history
         save_conversations(bot.conversation_histories)
-        log_context_occupancy(bot)  # <-- ВЫЗОВ ПОСЛЕ ОБНОВЛЕНИЯ ИСТОРИИ СООБЩЕНИЕМ ПОЛЬЗОВАТЕЛЯ
+        log_context_occupancy(bot)
+
+        # === АВТОМАТИЧЕСКИЙ ЗАПУСК ОПИСАНИЙ ДЛЯ НОВЫХ КАРТИНОК В ФОНЕ ===
+        for part in parts:
+            if isinstance(part, dict) and part.get("type") == "image_url":
+                url_obj = part.get("image_url", {})
+                url = url_obj.get("url", "")
+                m_id = url_obj.get("message_id")
+                c_id = url_obj.get("channel_id")
+                if url:
+                    asyncio.create_task(describe_image_async(
+                        url, 
+                        message_id=m_id, 
+                        channel_id=c_id, 
+                        bot=bot
+                    ))
 
     if is_pinged:
         if not bot.conversation_histories[context_id]:
@@ -284,7 +307,6 @@ async def on_message(message):
             "Отвечай сразу по существу, без метаданных в начале."
         )
 
-        # ДОБАВЛЕННЫЙ БЛОК ИНСТРУКЦИЙ ДЛЯ ПОСЛЕДОВАТЕЛЬНОГО ПОИСКА:
         sys_inst += (
             "\n\nТЕБЕ ДОСТУПЕН ПОСЛЕДОВАТЕЛЬНЫЙ МНОГОШАГОВЫЙ ПОИСК (ДО 3 ШАГОВ): "
             "Если после вызова `web_search` и получения результатов ты понимаешь, что информации для полного, "
@@ -301,14 +323,6 @@ async def on_message(message):
                 "Пример: <think>Тут твои размышления...</think>Твой финальный ответ."
             )
 
-
-        if context_id in bot.thinking_channels:
-            sys_inst += (
-                "\n\nВАЖНО: Перед тем как написать финальный краткий ответ, ты ДОЛЖЕН подробно поразмышлять. "
-                "Свои подробные размышления обязательно запиши внутри тегов <think> и </think> в самом начале ответа. "
-                "Пример: <think>Тут твои размышления...</think>Твой финальный ответ."
-            )
-
         async with message.channel.typing():
             try:
                 max_agent_loops = 3
@@ -316,7 +330,14 @@ async def on_message(message):
                 reply_text = "Не удалось сформулировать ответ."
                 
                 while current_loop < max_agent_loops:
-                    response = await generate_content_with_retry(history, sys_inst, tools=TOOLS)
+                    # Передаем статус режима !think в API с передачей экземпляра бота
+                    response = await generate_content_with_retry(
+                        history, 
+                        sys_inst, 
+                        tools=TOOLS, 
+                        thinking_enabled=(context_id in bot.thinking_channels),
+                        bot=bot
+                    )
                     tool_calls = getattr(response.choices[0].message, "tool_calls", None)
                     
                     if tool_calls:
@@ -333,7 +354,7 @@ async def on_message(message):
 
                         clean_content, tagged_reasoning = extract_and_strip_thoughts(content_raw)
                         
-                        thoughts = native_reasoning or tagged_reasoning
+                        thoughts = tagged_reasoning or native_reasoning
                         if thoughts:
                             print(f"\n[THINKING LOG - Channel {context_id} (Перед инструментом)]:\n{thoughts.strip()}\n[END THINKING LOG]\n", flush=True)
 
@@ -386,7 +407,6 @@ async def on_message(message):
                                 else:
                                     status_msg = await message.reply(f"🔍 Ищу в сети: {queries_display}...")
                                     
-                                    # ИЗМЕНЕНО: Добавлен именованный аргумент force_google_only=True
                                     search_results = await perform_search_async(queries_to_run, force_google_only=True)
                                     
                                     try:
@@ -460,29 +480,36 @@ async def on_message(message):
                         reply_text, tagged_reasoning = extract_and_strip_thoughts(content_raw)
                         reply_text = re.sub(r'^(\s*\[\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2}\]\s*)+', '', reply_text).strip()
 
-                        thoughts = native_reasoning or tagged_reasoning
+                        thoughts = tagged_reasoning or native_reasoning
                         if thoughts:
                             print(f"\n[THINKING LOG - Channel {context_id}]:\n{thoughts.strip()}\n[END THINKING LOG]\n", flush=True)
 
                         if not reply_text:
-                            has_tool_call = any(msg.get("role") == "tool" for msg in history)
-                            if has_tool_call:
-                                reply_text = "Готово! Запрос успешно выполнен."
+                            if thoughts:  # Если модель выдала ответ только в мыслях
+                                reply_text = thoughts
                             else:
-                                reply_text = "Не удалось сформулировать ответ."
+                                has_tool_call = any(msg.get("role") == "tool" for msg in history)
+                                if has_tool_call:
+                                    reply_text = "Готово! Запрос успешно выполнен."
+                                else:
+                                    reply_text = "Не удалось сформулировать ответ."
 
                         bot_timestamp_str = format_message_timestamp(datetime.now(timezone.utc))
                         history.append({"role": "assistant", "content": f"[{bot_timestamp_str}] {reply_text}"})
                         bot.conversation_histories[context_id] = prune_history_local(history, max_tokens=limits["max_context_tokens"])
                         save_conversations(bot.conversation_histories)
                         break
-                                # === ДОБАВЛЕННЫЙ БЛОК ДЛЯ ИСПРАВЛЕНИЯ ЛОГИКИ ЦИКЛА ===
-                # Если цикл завершился по лимиту шагов (current_loop == max_agent_loops),
-                # но последнее сообщение в истории — это ответ от инструмента,
-                # принудительно делаем финальный текстовый запрос к модели без инструментов.
+                
                 if history and history[-1].get("role") == "tool":
                     print(f"[AGENT] Достигнут лимит шагов ({max_agent_loops}). Запрашиваем финальный ответ...", flush=True)
-                    response = await generate_content_with_retry(history, sys_inst, tools=None)
+                    # Вызов финального ответа с передачей экземпляра бота
+                    response = await generate_content_with_retry(
+                        history, 
+                        sys_inst, 
+                        tools=None, 
+                        thinking_enabled=(context_id in bot.thinking_channels),
+                        bot=bot
+                    )
                     message_obj = response.choices[0].message
                     content_raw = message_obj.content or ""
                     
@@ -496,18 +523,20 @@ async def on_message(message):
                     reply_text = re.sub(r'^(\s*\[\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2}\]\s*)+', '', reply_text).strip()
 
 
-                    thoughts = native_reasoning or tagged_reasoning
+                    thoughts = tagged_reasoning or native_reasoning
                     if thoughts:
                         print(f"\n[THINKING LOG - Channel {context_id} (Final)]: \n{thoughts.strip()}\n[END THINKING LOG]\n", flush=True)
 
                     if not reply_text:
-                        reply_text = "Готово! Все запросы успешно выполнены."
+                        if thoughts:  # Если финальный ответ остался внутри тегов размышлений
+                            reply_text = thoughts
+                        else:
+                            reply_text = "Готово! Все запросы успешно выполнены."
                     
                     bot_timestamp_str = format_message_timestamp(datetime.now(timezone.utc))
                     history.append({"role": "assistant", "content": f"[{bot_timestamp_str}] {reply_text}"})
                     bot.conversation_histories[context_id] = prune_history_local(history, max_tokens=limits["max_context_tokens"])
                     save_conversations(bot.conversation_histories)
-                # ===================================================
 
                 log_last_message(history, "ASSISTANT_REPLY")
                 log_context_occupancy(bot)
